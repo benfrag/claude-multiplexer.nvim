@@ -19,42 +19,61 @@ local state = {
 }
 
 local status_dir = (vim.env.TMPDIR or "/tmp") .. "/cmax-status"
-local hook_script_path = vim.fn.expand("~/.claude/hooks/cmax-status.sh")
+local hook_script_path = vim.fn.expand("~/.claude/hooks/cmax-status.py")
+local old_hook_script_path = vim.fn.expand("~/.claude/hooks/cmax-status.sh")
 local settings_path = vim.fn.expand("~/.claude/settings.json")
 
 local item_height = 5
 local inner_height = item_height - 2
 
-local HOOK_SCRIPT = [[#!/bin/bash
-[ -z "$CMAX_ID" ] && exit 0
-STATUS_DIR="${TMPDIR:-/tmp}/cmax-status"
-mkdir -p "$STATUS_DIR"
-INPUT=$(cat)
-read -r EVENT NTYPE <<< $(echo "$INPUT" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-print(d.get('hook_event_name',''), d.get('notification_type',''))
-" 2>/dev/null)
-case "$EVENT" in
-  Stop)                STATUS="Waiting for input" ;;
-  UserPromptSubmit)    STATUS="Working..." ;;
-  PermissionRequest)   STATUS="Needs permission" ;;
-  SessionStart)        STATUS="Starting..." ;;
-  SessionEnd)          STATUS="Session ended" ;;
-  PostToolUseFailure)  STATUS="Tool error" ;;
-  PreCompact)          STATUS="Compacting..." ;;
-  SubagentStart)       STATUS="Working (subagent)..." ;;
-  Notification)
-    case "$NTYPE" in
-      permission_prompt) STATUS="Needs permission" ;;
-      idle_prompt)       STATUS="Idle" ;;
-      *)                 exit 0 ;;
-    esac ;;
-  *)                   exit 0 ;;
-esac
-TMPFILE="$STATUS_DIR/.cmax_${CMAX_ID}.tmp"
-printf '%s' "$STATUS" > "$TMPFILE"
-mv -f "$TMPFILE" "$STATUS_DIR/$CMAX_ID"
+local HOOK_SCRIPT = [[#!/usr/bin/env python3
+import json, sys, os
+
+d = json.load(sys.stdin)
+cmax_id = os.environ.get("CMAX_ID")
+if not cmax_id:
+    sys.exit(0)
+
+status_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "cmax-status")
+os.makedirs(status_dir, exist_ok=True)
+
+event = d.get("hook_event_name", "")
+ntype = d.get("notification_type", "")
+
+STATUS_MAP = {
+    "Stop": "Waiting for input",
+    "UserPromptSubmit": "Working...",
+    "PermissionRequest": "Needs permission",
+    "SessionStart": "Starting...",
+    "SessionEnd": "Session ended",
+    "PostToolUseFailure": "Tool error",
+    "PreCompact": "Compacting...",
+    "SubagentStart": "Working (subagent)...",
+}
+
+status = STATUS_MAP.get(event)
+if event == "Notification":
+    status = {"permission_prompt": "Needs permission", "idle_prompt": "Idle"}.get(ntype)
+if not status:
+    sys.exit(0)
+
+# Atomic write status
+tmp = os.path.join(status_dir, f".cmax_{cmax_id}.tmp")
+final = os.path.join(status_dir, cmax_id)
+with open(tmp, "w") as f:
+    f.write(status)
+os.rename(tmp, final)
+
+# Write prompt on UserPromptSubmit
+if event == "UserPromptSubmit":
+    prompt = d.get("prompt", "")
+    if isinstance(prompt, str) and prompt.strip():
+        prompt = prompt.replace("\n", " ").strip()[:80]
+        tmp2 = os.path.join(status_dir, f".cmax_{cmax_id}.prompt.tmp")
+        final2 = os.path.join(status_dir, f"{cmax_id}.prompt")
+        with open(tmp2, "w") as f:
+            f.write(prompt)
+        os.rename(tmp2, final2)
 ]]
 
 local HOOK_EVENTS = {
@@ -76,6 +95,7 @@ local STATUS_HL = {
 }
 
 local function install_hooks()
+   -- Write new .py hook script
    vim.fn.mkdir(vim.fn.fnamemodify(hook_script_path, ":h"), "p")
    local f = io.open(hook_script_path, "w")
    if not f then return end
@@ -83,6 +103,10 @@ local function install_hooks()
    f:close()
    vim.fn.system({ "chmod", "+x", hook_script_path })
 
+   -- Clean up old .sh script
+   os.remove(old_hook_script_path)
+
+   -- Patch settings.json: remove old .sh references, add .py
    local sf = io.open(settings_path, "r")
    if not sf then return end
    local content = sf:read("*a")
@@ -100,8 +124,22 @@ local function install_hooks()
    }
 
    local changed = false
+
    for _, event in ipairs(HOOK_EVENTS) do
       settings.hooks[event] = settings.hooks[event] or {}
+
+      -- Remove old .sh hook entries
+      for _, entry in ipairs(settings.hooks[event]) do
+         local hooks_list = entry.hooks or {}
+         for j = #hooks_list, 1, -1 do
+            if hooks_list[j].command == old_hook_script_path then
+               table.remove(hooks_list, j)
+               changed = true
+            end
+         end
+      end
+
+      -- Check if new .py hook already registered
       local found = false
       for _, entry in ipairs(settings.hooks[event]) do
          local hooks_list = entry.hooks or {}
@@ -310,6 +348,7 @@ local function delete_terminal(index, on_done)
          vim.api.nvim_buf_delete(term.buf, { force = true })
       end
       os.remove(status_dir .. "/" .. term.cmax_id)
+      os.remove(status_dir .. "/" .. term.cmax_id .. ".prompt")
       table.remove(state.terminals, index)
       if state.selected > item_count() then
          state.selected = item_count()
@@ -403,6 +442,16 @@ local function poll_statuses()
             changed = true
          end
       end
+      local pf = io.open(status_dir .. "/" .. term.cmax_id .. ".prompt", "r")
+      if pf then
+         local prompt = pf:read("*a")
+         pf:close()
+         if prompt ~= "" and prompt ~= term.last_prompt then
+            term.last_prompt = prompt
+            term.name = prompt
+            changed = true
+         end
+      end
    end
    if changed and state.menu_buf and vim.api.nvim_buf_is_valid(state.menu_buf)
       and state.win and vim.api.nvim_win_is_valid(state.win) then
@@ -428,6 +477,7 @@ function M.setup(opts)
          end
          for _, term in ipairs(state.terminals) do
             os.remove(status_dir .. "/" .. term.cmax_id)
+            os.remove(status_dir .. "/" .. term.cmax_id .. ".prompt")
          end
          os.remove(status_dir)
       end,

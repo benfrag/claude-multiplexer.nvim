@@ -374,9 +374,9 @@ local function open_selected(dangerously, resume)
          vim.cmd("startinsert")
       end
    else
-      local cmd = dangerously and "claude --dangerously-skip-permissions"
-         or resume and "claude -r"
-         or "claude"
+      local cmd = "claude"
+      if dangerously then cmd = cmd .. " --dangerously-skip-permissions" end
+      if resume then cmd = cmd .. " -r" end
       local label = dangerously
          and ("Claude " .. (state.counter + 1) .. " (yolo)")
          or nil
@@ -418,6 +418,11 @@ show_menu = function()
          end)
       else
          open_selected(true)
+      end
+   end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "D", function()
+      if state.selected > #state.terminals then
+         open_selected(true, true)
       end
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "q", function()

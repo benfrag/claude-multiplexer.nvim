@@ -365,7 +365,7 @@ local function delete_terminal(index, on_done)
    vim.keymap.set("n", "q", close_popup, { buffer = popup_buf, nowait = true })
 end
 
-local function open_selected(dangerously)
+local function open_selected(dangerously, resume)
    local index = state.selected
    if index <= #state.terminals then
       local term = state.terminals[index]
@@ -374,7 +374,9 @@ local function open_selected(dangerously)
          vim.cmd("startinsert")
       end
    else
-      local cmd = dangerously and "claude --dangerously-skip-permissions" or "claude"
+      local cmd = dangerously and "claude --dangerously-skip-permissions"
+         or resume and "claude -r"
+         or "claude"
       local label = dangerously
          and ("Claude " .. (state.counter + 1) .. " (yolo)")
          or nil
@@ -404,6 +406,11 @@ show_menu = function()
    vim.keymap.set("n", "<C-b>", function() select_item(state.selected - item_count()) end, { buffer = buf, nowait = true })
 
    vim.keymap.set("n", "<CR>", function() open_selected(false) end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "r", function()
+      if state.selected > #state.terminals then
+         open_selected(false, true)
+      end
+   end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "d", function()
       if state.selected <= #state.terminals then
          delete_terminal(state.selected, function()

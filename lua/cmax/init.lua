@@ -273,9 +273,12 @@ local function setup_term_keymaps(term_buf)
    end, { buffer = term_buf, nowait = true })
 end
 
-local function create_terminal(cmd, label)
+local function create_terminal(cmd, opts)
+   opts = opts or {}
    state.counter = state.counter + 1
-   local name = label or ("Claude " .. state.counter)
+   local provider = opts.provider or "claude"
+   local title = provider == "codex" and "Codex" or "Claude"
+   local name = opts.label or (title .. " " .. state.counter)
    local cmax_id = vim.fn.getpid() .. "_" .. state.counter
    local term_buf = vim.api.nvim_create_buf(false, true)
    vim.bo[term_buf].bufhidden = "hide"
@@ -285,7 +288,7 @@ local function create_terminal(cmd, label)
    env["CMAX_ID"] = cmax_id
    vim.fn.termopen(cmd, { env = env })
 
-   table.insert(state.terminals, { buf = term_buf, name = name, cmax_id = cmax_id })
+   table.insert(state.terminals, { buf = term_buf, name = name, cmax_id = cmax_id, provider = provider })
    setup_term_keymaps(term_buf)
    vim.cmd("startinsert")
 end
@@ -365,7 +368,12 @@ local function delete_terminal(index, on_done)
    vim.keymap.set("n", "q", close_popup, { buffer = popup_buf, nowait = true })
 end
 
-local function open_selected(dangerously, resume)
+local function open_selected(opts)
+   opts = opts or {}
+   local dangerously = opts.dangerously
+   local resume = opts.resume
+   local provider = opts.provider or "claude"
+
    local index = state.selected
    if index <= #state.terminals then
       local term = state.terminals[index]
@@ -374,13 +382,14 @@ local function open_selected(dangerously, resume)
          vim.cmd("startinsert")
       end
    else
-      local cmd = "claude"
-      if dangerously then cmd = cmd .. " --dangerously-skip-permissions" end
+      local cmd = provider
+      if provider == "claude" and dangerously then
+         cmd = cmd .. " --dangerously-skip-permissions"
+      end
       if resume then cmd = cmd .. " -r" end
-      local label = dangerously
-         and ("Claude " .. (state.counter + 1) .. " (yolo)")
-         or nil
-      create_terminal(cmd, label)
+      local title = provider == "codex" and "Codex" or "Claude"
+      local label = dangerously and (title .. " " .. (state.counter + 1) .. " (yolo)") or nil
+      create_terminal(cmd, { label = label, provider = provider })
    end
 end
 
@@ -405,10 +414,17 @@ show_menu = function()
    vim.keymap.set("n", "<C-f>", function() select_item(state.selected + item_count()) end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "<C-b>", function() select_item(state.selected - item_count()) end, { buffer = buf, nowait = true })
 
-   vim.keymap.set("n", "<CR>", function() open_selected(false) end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<CR>", function()
+      open_selected()
+   end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "r", function()
       if state.selected > #state.terminals then
-         open_selected(false, true)
+         open_selected({ resume = true })
+      end
+   end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "c", function()
+      if state.selected > #state.terminals then
+         open_selected({ provider = "codex" })
       end
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "d", function()
@@ -417,12 +433,12 @@ show_menu = function()
             render_menu(win)
          end)
       else
-         open_selected(true)
+         open_selected({ dangerously = true })
       end
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "D", function()
       if state.selected > #state.terminals then
-         open_selected(true, true)
+         open_selected({ dangerously = true, resume = true })
       end
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "q", function()

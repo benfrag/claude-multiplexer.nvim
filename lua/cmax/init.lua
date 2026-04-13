@@ -1056,6 +1056,7 @@ end
 
 local function setup_term_keymaps(term_buf)
    vim.keymap.set("t", "<C-]>", leave_terminal_mode, { buffer = term_buf, nowait = true, silent = true })
+   vim.keymap.set("t", "<C-\\>", leave_terminal_mode, { buffer = term_buf, nowait = true, silent = true })
    vim.keymap.set("n", "<C-]>", "<Nop>", { buffer = term_buf, nowait = true })
    vim.keymap.set("t", "<C-_>", function()
       leave_terminal_mode()

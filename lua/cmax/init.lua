@@ -1050,7 +1050,7 @@ local function build_command(opts)
 end
 
 local function setup_term_keymaps(term_buf)
-   vim.keymap.set("t", "<C-]>", [[<C-\\><C-n>]], { buffer = term_buf, nowait = true })
+   vim.keymap.set("t", "<C-]>", "<C-\\><C-n>", { buffer = term_buf, nowait = true })
    vim.keymap.set("n", "<C-]>", "<Nop>", { buffer = term_buf, nowait = true })
    vim.keymap.set("t", "<C-_>", function()
       vim.cmd("stopinsert")

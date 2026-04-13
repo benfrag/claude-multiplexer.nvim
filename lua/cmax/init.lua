@@ -1049,13 +1049,18 @@ local function build_command(opts)
    return cmd
 end
 
+local function leave_terminal_mode()
+   local keys = vim.api.nvim_replace_termcodes("<C-\\><C-n>", true, false, true)
+   vim.api.nvim_feedkeys(keys, "n", false)
+end
+
 local function setup_term_keymaps(term_buf)
-   vim.keymap.set("t", "<C-]>", "<C-\\><C-n>", { buffer = term_buf, nowait = true })
+   vim.keymap.set("t", "<C-]>", leave_terminal_mode, { buffer = term_buf, nowait = true, silent = true })
    vim.keymap.set("n", "<C-]>", "<Nop>", { buffer = term_buf, nowait = true })
    vim.keymap.set("t", "<C-_>", function()
-      vim.cmd("stopinsert")
-      show_menu()
-   end, { buffer = term_buf, nowait = true })
+      leave_terminal_mode()
+      vim.schedule(show_menu)
+   end, { buffer = term_buf, nowait = true, silent = true })
    vim.keymap.set("n", "-", function()
       show_menu()
    end, { buffer = term_buf, nowait = true })

@@ -776,10 +776,10 @@ end
 local function collect_term_transcript_lines(term, max_chars)
    local lines = {}
 
-   local function append(role, text)
+   local function append(text)
       text = normalize_search_text(text)
       if not text then return end
-      push_limited_lines(lines, string.format("%s: %s", role, text), max_chars)
+      push_limited_lines(lines, text, max_chars)
    end
 
    if term.provider == "codex" then
@@ -789,8 +789,8 @@ local function collect_term_transcript_lines(term, max_chars)
          if f then
             for line in f:lines() do
                local role, text = extract_codex_search_text(decode_json_line(line))
-               if role and text then
-                  append(role == "user" and "User" or "Assistant", text)
+               if role == "user" and text then
+                  append(text)
                end
             end
             f:close()
@@ -804,8 +804,8 @@ local function collect_term_transcript_lines(term, max_chars)
          if f then
             for line in f:lines() do
                local role, text = extract_claude_search_text(decode_json_line(line))
-               if role and text then
-                  append(role == "user" and "User" or "Assistant", text)
+               if role == "user" and text then
+                  append(text)
                end
             end
             f:close()
@@ -816,7 +816,7 @@ local function collect_term_transcript_lines(term, max_chars)
    if #lines == 0 then
       local prompts = get_term_prompt_history(term) or {}
       for _, prompt in ipairs(prompts) do
-         append("User", prompt)
+         append(prompt)
       end
    end
 
@@ -828,8 +828,8 @@ local function build_tab_filter_candidates()
    local candidates = {}
 
    for index, term in ipairs(state.terminals) do
-      local transcript_lines = collect_term_transcript_lines(term, opts.max_context_chars_per_tab)
-      local transcript = table.concat(transcript_lines, "\n")
+      local prompt_lines = collect_term_transcript_lines(term, opts.max_context_chars_per_tab)
+      local user_prompts = table.concat(prompt_lines, "\n")
       candidates[#candidates + 1] = {
          tab_index = index,
          cmax_id = term.cmax_id,
@@ -839,7 +839,7 @@ local function build_tab_filter_candidates()
          status = term.status or "",
          cwd = term.cwd or "",
          session_id = provider_session_id(term),
-         transcript = transcript,
+         user_prompts = user_prompts,
       }
    end
 
@@ -856,7 +856,7 @@ local function build_tab_filter_prompt(query, candidate)
          status = candidate.status,
          cwd = candidate.cwd,
          session_id = candidate.session_id,
-         transcript = candidate.transcript,
+         user_prompts = candidate.user_prompts,
       },
    }
 
@@ -864,7 +864,7 @@ local function build_tab_filter_prompt(query, candidate)
       "You evaluate whether a single open Neovim chat tab matches a semantic query.",
       'Return JSON only in the exact shape {"match":true,"score":0.0,"reason":"..."} and nothing else.',
       "Rules:",
-      "- Consider the tab heading, last prompt, provider, status, cwd, and the full transcript.",
+      "- Consider the tab heading, last prompt, provider, status, cwd, and the full user prompt history.",
       "- match must be true or false.",
       "- If the tab is not relevant, set match=false and score=0.",
       "- If the tab is relevant, set match=true and score between 0 and 1.",

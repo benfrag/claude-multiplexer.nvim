@@ -18,6 +18,8 @@ local state = {
    status_lines = {},
    view = "menu",
    saved_sessions = {},
+   filtered_terminals = {},
+   tab_filter_query = nil,
    session_picker_return_to_menu = false,
    codex_claimed_sessions = {},
    codex_history_offset = 0,
@@ -34,6 +36,11 @@ local state = {
    active_heading_job = nil,
    heading_backoff_until = 0,
    heading_failure_message = nil,
+   tab_filter_opts = nil,
+   active_tab_filter_job = nil,
+   tab_filter_loading = false,
+   tab_filter_error = nil,
+   tab_filter_return_selected = nil,
 }
 
 local status_dir = (vim.env.TMPDIR or "/tmp") .. "/cmax-status"
@@ -159,12 +166,15 @@ local STATUS_HL = {
 local show_menu
 local show_saved_sessions
 local show_chat_search
+local show_tab_filter_results
+local prompt_tab_filter
 local get_codex_session_meta
 local normalize_search_text
 local truncate_text
 local provider_title
 local provider_session_id
 local pump_term_heading_jobs
+local find_terminal
 
 local function read_file(path)
    local f = io.open(path, "r")
@@ -260,6 +270,38 @@ local function normalize_auto_heading_opts(opts)
          opts.max_context_chars = defaults.max_context_chars
       end
    end
+   if opts.keepalive == false or opts.keepalive == "" then
+      opts.keepalive = nil
+   elseif opts.keepalive ~= nil then
+      opts.keepalive = tostring(opts.keepalive)
+   end
+   return opts
+end
+
+local function normalize_tab_filter_opts(opts)
+   local defaults = {
+      enabled = true,
+      command = { "ollama" },
+      model = "qwen2.5:3b",
+      debounce_ms = 0,
+      keepalive = "2m",
+      timeout_ms = 45000,
+      max_context_chars_per_tab = 12000,
+      max_reason_chars = 90,
+   }
+
+   opts = vim.tbl_deep_extend("force", defaults, opts or {})
+   if type(opts.command) == "string" then
+      opts.command = { opts.command }
+   end
+   if not vim.islist(opts.command) or #opts.command == 0 then
+      opts.command = { "ollama" }
+   end
+   opts.enabled = not not opts.enabled
+   opts.debounce_ms = math.max(0, tonumber(opts.debounce_ms) or defaults.debounce_ms)
+   opts.timeout_ms = math.max(1000, tonumber(opts.timeout_ms) or defaults.timeout_ms)
+   opts.max_context_chars_per_tab = math.max(1000, tonumber(opts.max_context_chars_per_tab) or defaults.max_context_chars_per_tab)
+   opts.max_reason_chars = math.max(20, tonumber(opts.max_reason_chars) or defaults.max_reason_chars)
    if opts.keepalive == false or opts.keepalive == "" then
       opts.keepalive = nil
    elseif opts.keepalive ~= nil then
@@ -598,6 +640,163 @@ local function parse_term_heading_output(output)
    end
 
    return sanitize_heading(output)
+end
+
+local function shorten_text_middle(text, max_len)
+   if type(text) ~= "string" then return "" end
+   if #text <= max_len then return text end
+   local head = math.floor((max_len - 3) / 2)
+   local tail = max_len - 3 - head
+   return text:sub(1, head) .. "..." .. text:sub(#text - tail + 1)
+end
+
+local function push_limited_lines(lines, line, max_chars)
+   if not line or line == "" then return 0 end
+   lines[#lines + 1] = line
+
+   if not max_chars then return #line + 1 end
+
+   local total = 0
+   for _, value in ipairs(lines) do
+      total = total + #value + 1
+   end
+
+   while total > max_chars and #lines > 1 do
+      local first = lines[1]
+      total = total - (#first + 1)
+      table.remove(lines, 1)
+   end
+
+   return total
+end
+
+local function find_claude_project_path(session_id)
+   if not session_id or session_id == "" then return nil end
+   local paths = vim.fn.glob(claude_projects_path .. "/**/" .. session_id .. ".jsonl", false, true)
+   return paths[1]
+end
+
+local function collect_term_transcript_lines(term, max_chars)
+   local lines = {}
+
+   local function append(role, text)
+      text = normalize_search_text(text)
+      if not text then return end
+      push_limited_lines(lines, string.format("%s: %s", role, text), max_chars)
+   end
+
+   if term.provider == "codex" then
+      local path = term.codex_session_path
+      if path and path ~= "" then
+         local f = io.open(path, "r")
+         if f then
+            for line in f:lines() do
+               local role, text = extract_codex_search_text(decode_json_line(line))
+               if role and text then
+                  append(role == "user" and "User" or "Assistant", text)
+               end
+            end
+            f:close()
+         end
+      end
+   elseif term.provider == "claude" then
+      local session_id = term.claude_session_id
+      local path = find_claude_project_path(session_id)
+      if path then
+         local f = io.open(path, "r")
+         if f then
+            for line in f:lines() do
+               local role, text = extract_claude_search_text(decode_json_line(line))
+               if role and text then
+                  append(role == "user" and "User" or "Assistant", text)
+               end
+            end
+            f:close()
+         end
+      end
+   end
+
+   if #lines == 0 then
+      local prompts = get_term_prompt_history(term) or {}
+      for _, prompt in ipairs(prompts) do
+         append("User", prompt)
+      end
+   end
+
+   return lines
+end
+
+local function build_tab_filter_candidates()
+   local opts = state.tab_filter_opts or {}
+   local candidates = {}
+
+   for index, term in ipairs(state.terminals) do
+      local transcript_lines = collect_term_transcript_lines(term, opts.max_context_chars_per_tab)
+      local transcript = table.concat(transcript_lines, "\n")
+      candidates[#candidates + 1] = {
+         tab_index = index,
+         cmax_id = term.cmax_id,
+         provider = term.provider,
+         heading = term.name or default_term_name(term),
+         last_prompt = term.last_prompt or "",
+         status = term.status or "",
+         cwd = term.cwd or "",
+         session_id = provider_session_id(term),
+         transcript = transcript,
+      }
+   end
+
+   return candidates
+end
+
+local function build_tab_filter_prompt(query, candidates)
+   local tabs = {}
+   for _, candidate in ipairs(candidates) do
+      tabs[#tabs + 1] = {
+         tab_index = candidate.tab_index,
+         provider = candidate.provider,
+         heading = candidate.heading,
+         last_prompt = candidate.last_prompt,
+         status = candidate.status,
+         cwd = candidate.cwd,
+         session_id = candidate.session_id,
+         transcript = candidate.transcript,
+      }
+   end
+
+   local payload = {
+      query = query,
+      tabs = tabs,
+   }
+
+   return table.concat({
+      "You filter open Neovim chat tabs by semantic relevance.",
+      'Return JSON only in the exact shape {"matches":[{"tab_index":1,"score":0.0,"reason":"..."}]}.',
+      "Rules:",
+      "- Consider the full tab transcript, heading, last prompt, provider, status, and cwd.",
+      "- Include only tabs that are genuinely relevant to the query.",
+      "- score must be between 0 and 1.",
+      "- Sort matches from most relevant to least relevant.",
+      "- reason must be a very short phrase, not a sentence.",
+      "- If nothing matches, return an empty matches array.",
+      "",
+      vim.json.encode(payload),
+   }, "\n")
+end
+
+local function parse_tab_filter_output(output)
+   output = type(output) == "string" and vim.trim(output) or ""
+   if output == "" then return {}, true end
+
+   local decoded = decode_json(output)
+   if type(decoded) ~= "table" then
+      decoded = decode_json(output:match("%b{}"))
+   end
+   if type(decoded) ~= "table" or not vim.islist(decoded.matches) then
+      return nil, false
+   end
+
+   return decoded.matches, true
 end
 
 local function new_state_id()
@@ -1103,9 +1302,19 @@ local function saved_session_count()
    return #state.saved_sessions
 end
 
+local function filtered_terminal_count()
+   if #state.filtered_terminals == 0 then
+      return 1
+   end
+   return #state.filtered_terminals
+end
+
 local function current_item_count()
    if state.view == "sessions" then
       return saved_session_count()
+   end
+   if state.view == "filter" then
+      return filtered_terminal_count()
    end
    return menu_item_count()
 end
@@ -1271,6 +1480,85 @@ local function render_saved_sessions(win)
    end
 end
 
+local function render_filtered_terminals(win)
+   local buf = state.menu_buf
+   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+   state.view = "filter"
+
+   local box_width = vim.api.nvim_win_get_width(win)
+   if box_width < 6 then box_width = 6 end
+   local inner_width = box_width - 4
+   local top = "+" .. string.rep("-", box_width - 2) .. "+"
+   local bottom = top
+   local empty = "|" .. string.rep(" ", box_width - 2) .. "|"
+
+   local lines = {}
+   state.status_lines = {}
+
+   if state.tab_filter_loading then
+      table.insert(lines, top)
+      table.insert(lines, pad_line("Filtering tabs...", inner_width))
+      table.insert(lines, pad_line(state.tab_filter_query or "", inner_width))
+      table.insert(lines, pad_line("Press q or <Esc> to go back", inner_width))
+      table.insert(lines, bottom)
+   elseif state.tab_filter_error then
+      table.insert(lines, top)
+      table.insert(lines, pad_line("Tab filter failed", inner_width))
+      table.insert(lines, pad_line(state.tab_filter_error, inner_width))
+      table.insert(lines, pad_line("Press s to try again, q to go back", inner_width))
+      table.insert(lines, bottom)
+   elseif #state.filtered_terminals == 0 then
+      table.insert(lines, top)
+      table.insert(lines, pad_line("No matching tabs", inner_width))
+      table.insert(lines, pad_line(state.tab_filter_query or "", inner_width))
+      table.insert(lines, pad_line("Press q or <Esc> to go back", inner_width))
+      table.insert(lines, bottom)
+   else
+      for _, item in ipairs(state.filtered_terminals) do
+         local live_term = item.cmax_id and find_terminal(item.cmax_id) or nil
+         local heading = item.heading
+         local status = item.status
+         local display_cwd = item.display_cwd
+         if live_term then
+            heading = live_term.name or default_term_name(live_term)
+            status = live_term.status or ""
+            display_cwd = shorten_path(live_term.cwd or "")
+         end
+
+         table.insert(lines, top)
+         table.insert(lines, pad_line(heading, inner_width))
+         table.insert(lines, pad_line("  * " .. item.reason, inner_width))
+         local meta = table.concat(vim.tbl_filter(function(value)
+            return value and value ~= ""
+         end, {
+            item.display_score,
+            status,
+            display_cwd,
+         }), "  ")
+         if meta ~= "" then
+            table.insert(lines, pad_line(meta, inner_width))
+         else
+            table.insert(lines, empty)
+         end
+         table.insert(lines, bottom)
+      end
+   end
+
+   vim.bo[buf].modifiable = true
+   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+   vim.bo[buf].modifiable = false
+
+   if state.selected > filtered_terminal_count() then
+      state.selected = filtered_terminal_count()
+   end
+   apply_highlights(buf)
+
+   local target = (state.selected - 1) * item_height + 1
+   if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_set_cursor(win, { target, 0 })
+   end
+end
+
 local function select_item(index)
    if index < 1 then index = 1 end
    local count = current_item_count()
@@ -1287,10 +1575,18 @@ local function select_item(index)
    vim.api.nvim_win_set_cursor(win, { target, 0 })
 end
 
-local function find_terminal(cmax_id)
+find_terminal = function(cmax_id)
    for _, term in ipairs(state.terminals) do
       if term.cmax_id == cmax_id then
          return term
+      end
+   end
+end
+
+local function find_terminal_with_index(cmax_id)
+   for index, term in ipairs(state.terminals) do
+      if term.cmax_id == cmax_id then
+         return term, index
       end
    end
 end
@@ -1318,6 +1614,239 @@ local function focus_terminal_session(term, index)
    vim.cmd("startinsert")
    save_current_session()
    return true
+end
+
+local function close_tab_filter_view()
+   state.active_tab_filter_job = nil
+   state.tab_filter_loading = false
+   state.tab_filter_error = nil
+   state.filtered_terminals = {}
+   state.tab_filter_query = nil
+
+   local selected = state.tab_filter_return_selected
+   if selected then
+      state.selected = math.max(1, math.min(selected, menu_item_count()))
+   end
+   state.tab_filter_return_selected = nil
+   show_menu()
+end
+
+local function open_filtered_selected()
+   local item = state.filtered_terminals[state.selected]
+   if not item then return end
+
+   local term, index
+   if item.cmax_id then
+      term, index = find_terminal_with_index(item.cmax_id)
+   end
+   if not term and item.tab_index and state.terminals[item.tab_index] then
+      term = state.terminals[item.tab_index]
+      index = item.tab_index
+   end
+
+   if not term then
+      vim.notify("cmax: the filtered tab is no longer open", vim.log.levels.WARN)
+      show_menu()
+      return
+   end
+
+   state.tab_filter_return_selected = nil
+   focus_terminal_session(term, index)
+end
+
+local function set_filter_keymaps(buf)
+   vim.keymap.set("n", "j", function() select_item(state.selected + 1) end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "k", function() select_item(state.selected - 1) end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "G", function() select_item(filtered_terminal_count()) end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "gg", function() select_item(1) end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<C-d>", function()
+      local half = math.max(1, math.floor(filtered_terminal_count() / 2))
+      select_item(state.selected + half)
+   end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<C-u>", function()
+      local half = math.max(1, math.floor(filtered_terminal_count() / 2))
+      select_item(state.selected - half)
+   end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<CR>", open_filtered_selected, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "s", prompt_tab_filter, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "q", close_tab_filter_view, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<Esc>", close_tab_filter_view, { buffer = buf, nowait = true })
+end
+
+local function ensure_filter_view()
+   local win = ensure_window()
+   local buf = state.menu_buf
+   if not (buf and vim.api.nvim_buf_is_valid(buf) and state.view == "filter") then
+      buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].bufhidden = "wipe"
+      state.menu_buf = buf
+      vim.api.nvim_win_set_buf(win, buf)
+      set_filter_keymaps(buf)
+
+      vim.api.nvim_create_autocmd("WinResized", {
+         buffer = buf,
+         callback = function()
+            if vim.api.nvim_win_is_valid(win) then
+               render_filtered_terminals(win)
+            end
+         end,
+      })
+   else
+      vim.api.nvim_win_set_buf(win, buf)
+   end
+
+   return buf, win
+end
+
+local function normalize_filter_score(value)
+   local score = tonumber(value) or 0
+   if score < 0 then return 0 end
+   if score > 1 then return 1 end
+   return score
+end
+
+local function build_filtered_tab_items(matches, candidates)
+   local opts = state.tab_filter_opts or {}
+   local max_reason_chars = opts.max_reason_chars or 90
+   local by_index = {}
+   local items = {}
+   local seen = {}
+
+   for _, candidate in ipairs(candidates or {}) do
+      by_index[candidate.tab_index] = candidate
+   end
+
+   for ordinal, match in ipairs(matches or {}) do
+      if type(match) == "table" then
+         local tab_index = tonumber(match.tab_index)
+         local candidate = tab_index and by_index[tab_index] or nil
+         if candidate and not seen[tab_index] then
+            seen[tab_index] = true
+            local score = normalize_filter_score(match.score)
+            local reason = normalize_search_text(match.reason) or "semantic match"
+            items[#items + 1] = {
+               cmax_id = candidate.cmax_id,
+               tab_index = candidate.tab_index,
+               heading = candidate.heading,
+               reason = truncate_text(reason, max_reason_chars),
+               score = score,
+               display_score = string.format("match %.0f%%", score * 100),
+               status = candidate.status or "",
+               display_cwd = shorten_path(candidate.cwd or ""),
+               ordinal = ordinal,
+            }
+         end
+      end
+   end
+
+   table.sort(items, function(a, b)
+      if a.score == b.score then
+         return a.ordinal < b.ordinal
+      end
+      return a.score > b.score
+   end)
+
+   for _, item in ipairs(items) do
+      item.ordinal = nil
+   end
+
+   return items
+end
+
+show_tab_filter_results = function(items, query, opts)
+   opts = opts or {}
+
+   if state.view ~= "filter" then
+      state.tab_filter_return_selected = state.selected
+   end
+
+   state.filtered_terminals = items or {}
+   state.tab_filter_query = query
+   state.tab_filter_loading = not not opts.loading
+   state.tab_filter_error = opts.error and normalize_search_text(opts.error) or nil
+   state.selected = 1
+
+   local _, win = ensure_filter_view()
+   render_filtered_terminals(win)
+end
+
+prompt_tab_filter = function()
+   local opts = state.tab_filter_opts or {}
+   if not opts.enabled then
+      vim.notify("cmax: semantic tab filter is disabled", vim.log.levels.WARN)
+      return
+   end
+
+   if vim.fn.executable(opts.command[1]) ~= 1 then
+      vim.notify("cmax: tab filter command is not available: " .. opts.command[1], vim.log.levels.ERROR)
+      return
+   end
+
+   local model = opts.model
+      or (state.auto_heading_opts and state.auto_heading_opts.model)
+      or "qwen2.5:1.5b"
+
+   vim.ui.input({
+      prompt = "Filter tabs> ",
+      default = state.tab_filter_query or "",
+   }, function(input)
+      local query = normalize_search_text(input)
+      if not query then return end
+
+      local candidates = build_tab_filter_candidates()
+      if #candidates == 0 then
+         vim.notify("cmax: no open tabs to filter", vim.log.levels.INFO)
+         return
+      end
+
+      local request = {
+         id = tostring(vim.uv.hrtime()),
+         query = query,
+      }
+      state.active_tab_filter_job = request
+      show_tab_filter_results({}, query, { loading = true })
+
+      local cmd = vim.deepcopy(opts.command)
+      table.insert(cmd, "run")
+      table.insert(cmd, model)
+      table.insert(cmd, "--format")
+      table.insert(cmd, "json")
+      table.insert(cmd, "--hidethinking")
+      table.insert(cmd, "--nowordwrap")
+      if opts.keepalive then
+         table.insert(cmd, "--keepalive")
+         table.insert(cmd, opts.keepalive)
+      end
+      table.insert(cmd, build_tab_filter_prompt(query, candidates))
+
+      vim.system(cmd, { text = true, timeout = opts.timeout_ms }, function(result)
+         vim.schedule(function()
+            if not state.active_tab_filter_job or state.active_tab_filter_job.id ~= request.id then
+               return
+            end
+
+            state.active_tab_filter_job = nil
+
+            if result.code ~= 0 then
+               local error_text = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+               show_tab_filter_results({}, query, {
+                  error = error_text ~= "" and error_text or "model request failed",
+               })
+               return
+            end
+
+            local matches, ok = parse_tab_filter_output(result.stdout)
+            if not ok then
+               show_tab_filter_results({}, query, {
+                  error = "model returned invalid JSON",
+               })
+               return
+            end
+
+            show_tab_filter_results(build_filtered_tab_items(matches, candidates), query)
+         end)
+      end)
+   end)
 end
 
 local function open_chat_search_result(provider, session_id, cwd, transcript_path, label)
@@ -1378,6 +1907,8 @@ local function rerender_active_view()
 
    if state.view == "sessions" then
       render_saved_sessions(state.win)
+   elseif state.view == "filter" then
+      render_filtered_terminals(state.win)
    else
       render_menu(state.win)
    end
@@ -1721,11 +2252,7 @@ local function create_terminal(cmd, opts)
             save_current_session()
             if state.menu_buf and vim.api.nvim_buf_is_valid(state.menu_buf)
                and state.win and vim.api.nvim_win_is_valid(state.win) then
-               if state.view == "sessions" then
-                  render_saved_sessions(state.win)
-               else
-                  render_menu(state.win)
-               end
+               rerender_active_view()
             end
          end)
       end,
@@ -1954,6 +2481,15 @@ show_saved_sessions = function(opts)
       restore_saved_session(state.selected)
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "f", show_chat_search, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<Esc>", function()
+      if state.session_picker_return_to_menu and state.win and vim.api.nvim_win_is_valid(state.win) then
+         show_menu()
+      elseif state.win and vim.api.nvim_win_is_valid(state.win) then
+         vim.api.nvim_win_close(state.win, true)
+         state.win = nil
+         state.menu_buf = nil
+      end
+   end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "q", function()
       if state.session_picker_return_to_menu and state.win and vim.api.nvim_win_is_valid(state.win) then
          show_menu()
@@ -2017,6 +2553,7 @@ show_menu = function()
       show_saved_sessions({ return_to_menu = true })
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "f", show_chat_search, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "s", prompt_tab_filter, { buffer = buf, nowait = true })
    for key, profile in pairs(state.launch_profiles) do
       vim.keymap.set("n", key, function()
          if state.selected > #state.terminals then
@@ -2039,6 +2576,11 @@ show_menu = function()
       end
    end, { buffer = buf, nowait = true })
    vim.keymap.set("n", "q", function()
+      vim.api.nvim_win_close(win, true)
+      state.win = nil
+      state.menu_buf = nil
+   end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "<Esc>", function()
       vim.api.nvim_win_close(win, true)
       state.win = nil
       state.menu_buf = nil
@@ -2105,11 +2647,7 @@ local function poll_statuses()
       and state.win and vim.api.nvim_win_is_valid(state.win) then
       vim.schedule(function()
          if not (state.win and vim.api.nvim_win_is_valid(state.win)) then return end
-         if state.view == "sessions" then
-            render_saved_sessions(state.win)
-         else
-            render_menu(state.win)
-         end
+         rerender_active_view()
       end)
    end
 end
@@ -2118,6 +2656,7 @@ function M.setup(opts)
    opts = opts or {}
    state.launch_profiles = normalize_launch_profiles(opts.launch_profiles)
    state.auto_heading_opts = normalize_auto_heading_opts(opts.auto_headings)
+   state.tab_filter_opts = normalize_tab_filter_opts(opts.tab_filter)
 
    install_hooks()
    pcall(vim.fn.mkdir, cmax_sessions_dir, "p")
@@ -2152,6 +2691,7 @@ function M.setup(opts)
    end)
 
    vim.keymap.set("n", "<Leader>cf", show_chat_search)
+   vim.keymap.set("n", "<Leader>cs", prompt_tab_filter)
 end
 
 return M

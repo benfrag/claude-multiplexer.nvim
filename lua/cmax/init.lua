@@ -22,12 +22,18 @@ local state = {
    codex_claimed_sessions = {},
    codex_history_offset = 0,
    codex_latest_prompts = {},
+   codex_prompt_history = {},
    codex_session_cache = {},
    claude_history_offset = 0,
    claude_latest_prompts = {},
+   claude_prompt_history = {},
    launch_profiles = {},
    multiplexer_session_id = nil,
    multiplexer_created_at = nil,
+   auto_heading_opts = nil,
+   active_heading_job = nil,
+   heading_backoff_until = 0,
+   heading_failure_message = nil,
 }
 
 local status_dir = (vim.env.TMPDIR or "/tmp") .. "/cmax-status"
@@ -36,6 +42,7 @@ local claude_old_hook_script_path = vim.fn.expand("~/.claude/hooks/cmax-status.s
 local claude_settings_path = vim.fn.expand("~/.claude/settings.json")
 local claude_history_path = vim.fn.expand("~/.claude/history.jsonl")
 local claude_sessions_path = vim.fn.expand("~/.claude/sessions")
+local claude_projects_path = vim.fn.expand("~/.claude/projects")
 local codex_hook_script_path = vim.fn.expand("~/.codex/hooks/cmax-status.py")
 local codex_hooks_path = vim.fn.expand("~/.codex/hooks.json")
 local codex_config_path = vim.fn.expand("~/.codex/config.toml")
@@ -151,6 +158,13 @@ local STATUS_HL = {
 
 local show_menu
 local show_saved_sessions
+local show_chat_search
+local get_codex_session_meta
+local normalize_search_text
+local truncate_text
+local provider_title
+local provider_session_id
+local pump_term_heading_jobs
 
 local function read_file(path)
    local f = io.open(path, "r")
@@ -202,12 +216,388 @@ local function sanitize_prompt(prompt)
    return prompt
 end
 
+local function sanitize_heading(heading)
+   if type(heading) ~= "string" then return nil end
+   heading = heading:gsub("\r", "")
+   heading = heading:match("([^\n]+)") or heading
+   heading = heading:gsub("^%s*heading%s*:%s*", "")
+   heading = heading:gsub("^%s*[\"'`]", "")
+   heading = heading:gsub("[\"'`]%s*$", "")
+   heading = normalize_search_text(heading)
+   if not heading then return nil end
+   if vim.fn.strdisplaywidth(heading) > 80 then
+      heading = truncate_text(heading, 80)
+   end
+   return heading
+end
+
+local function normalize_auto_heading_opts(opts)
+   local defaults = {
+      enabled = true,
+      command = { "ollama" },
+      model = "qwen2.5:1.5b",
+      debounce_ms = 1500,
+      keepalive = "2m",
+      timeout_ms = 30000,
+      max_context_chars = nil,
+   }
+
+   opts = vim.tbl_deep_extend("force", defaults, opts or {})
+   if type(opts.command) == "string" then
+      opts.command = { opts.command }
+   end
+   if not vim.islist(opts.command) or #opts.command == 0 then
+      opts.command = { "ollama" }
+   end
+   opts.enabled = not not opts.enabled
+   opts.debounce_ms = math.max(0, tonumber(opts.debounce_ms) or defaults.debounce_ms)
+   opts.timeout_ms = math.max(1000, tonumber(opts.timeout_ms) or defaults.timeout_ms)
+   if opts.max_context_chars ~= nil then
+      local max_context_chars = tonumber(opts.max_context_chars)
+      if max_context_chars then
+         opts.max_context_chars = math.max(1000, max_context_chars)
+      else
+         opts.max_context_chars = defaults.max_context_chars
+      end
+   end
+   if opts.keepalive == false or opts.keepalive == "" then
+      opts.keepalive = nil
+   elseif opts.keepalive ~= nil then
+      opts.keepalive = tostring(opts.keepalive)
+   end
+   return opts
+end
+
+local function default_term_name(term)
+   return term.default_name or term.name or provider_title(term.provider)
+end
+
+local function refresh_term_name(term)
+   local name = term.generated_heading or term.last_prompt or default_term_name(term)
+   if not name or name == "" then
+      name = provider_title(term.provider)
+   end
+   if name == term.name then return false end
+   term.name = name
+   return true
+end
+
+local function prompt_history_store(provider)
+   if provider == "codex" then
+      return state.codex_prompt_history
+   end
+   if provider == "claude" then
+      return state.claude_prompt_history
+   end
+end
+
+normalize_search_text = function(text)
+   if type(text) ~= "string" then return nil end
+   text = text:gsub("[%z\1-\31]", " ")
+   text = text:gsub("%s+", " ")
+   text = vim.trim(text)
+   if text == "" then return nil end
+   return text
+end
+
+truncate_text = function(text, max_len)
+   if type(text) ~= "string" then return "" end
+   if #text <= max_len then return text end
+   return text:sub(1, max_len - 3) .. "..."
+end
+
+local function shorten_path(path)
+   if type(path) ~= "string" or path == "" then return "" end
+   local home = vim.env.HOME or ""
+   if home ~= "" and path:sub(1, #home) == home then
+      path = "~" .. path:sub(#home + 1)
+   end
+   return vim.fn.pathshorten(path)
+end
+
+local function timestamp_to_unix(value)
+   if type(value) == "number" then
+      if value > 1000000000000 then
+         return math.floor(value / 1000)
+      end
+      return value
+   end
+   if type(value) ~= "string" then return 0 end
+
+   local year, month, day, hour, min, sec = value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)")
+   if not year then return 0 end
+
+   return os.time({
+      year = tonumber(year),
+      month = tonumber(month),
+      day = tonumber(day),
+      hour = tonumber(hour),
+      min = tonumber(min),
+      sec = tonumber(sec),
+   })
+end
+
+local function format_search_timestamp(value)
+   local unix = timestamp_to_unix(value)
+   if unix <= 0 then return "" end
+   return os.date("%Y-%m-%d %H:%M", unix)
+end
+
+local function build_chat_search_entry(provider, session_id, cwd, transcript_path, role, text, timestamp)
+   text = normalize_search_text(text)
+   if not text then return nil end
+
+   return {
+      provider = provider,
+      session_id = session_id,
+      cwd = cwd or "",
+      transcript_path = transcript_path,
+      role = role or "",
+      preview = truncate_text(text, 180),
+      text = truncate_text(text, 4000),
+      sort_time = timestamp_to_unix(timestamp),
+      display_time = format_search_timestamp(timestamp),
+      display_cwd = shorten_path(cwd),
+   }
+end
+
+local function extract_codex_search_text(entry)
+   if type(entry) ~= "table" or entry.type ~= "response_item" then return nil end
+
+   local payload = entry.payload
+   if type(payload) ~= "table" or payload.type ~= "message" then return nil end
+
+   local role = payload.role
+   if role ~= "user" and role ~= "assistant" then return nil end
+
+   local content = payload.content
+   local chunks = {}
+
+   if type(content) == "string" then
+      chunks[1] = content
+   elseif vim.islist(content) then
+      for _, item in ipairs(content) do
+         if type(item) == "table" then
+            local item_type = item.type
+            if (item_type == "input_text" or item_type == "output_text" or item_type == "text")
+               and type(item.text) == "string" then
+               chunks[#chunks + 1] = item.text
+            end
+         end
+      end
+   end
+
+   if #chunks == 0 then return nil end
+   return role, table.concat(chunks, "\n"), entry.timestamp
+end
+
+local function extract_claude_search_text(entry)
+   if type(entry) ~= "table" then return nil end
+
+   local role = entry.type
+   local message = entry.message
+   if type(message) ~= "table" then return nil end
+   role = message.role or role
+   if role ~= "user" and role ~= "assistant" then return nil end
+
+   local content = message.content
+   local chunks = {}
+
+   if type(content) == "string" then
+      chunks[1] = content
+   elseif vim.islist(content) then
+      for _, item in ipairs(content) do
+         if type(item) == "table" and item.type == "text" and type(item.text) == "string" then
+            chunks[#chunks + 1] = item.text
+         end
+      end
+   end
+
+   if #chunks == 0 then return nil end
+   return role, table.concat(chunks, "\n"), entry.timestamp
+end
+
+local function collect_codex_chat_search_entries(entries)
+   local paths = vim.fn.glob(codex_sessions_path .. "/**/*.jsonl", false, true)
+
+   for _, path in ipairs(paths) do
+      local meta = get_codex_session_meta(path)
+      local session_id = meta.session_id or path:match("([0-9a-f%-]+)%.jsonl$")
+      local cwd = meta.cwd or ""
+      local f = io.open(path, "r")
+      if f then
+         for line in f:lines() do
+            local role, text, timestamp = extract_codex_search_text(decode_json_line(line))
+            local item = build_chat_search_entry("codex", session_id, cwd, path, role, text, timestamp)
+            if item then entries[#entries + 1] = item end
+         end
+         f:close()
+      end
+   end
+end
+
+local function collect_claude_chat_search_entries(entries)
+   local paths = vim.fn.glob(claude_projects_path .. "/**/*.jsonl", false, true)
+
+   for _, path in ipairs(paths) do
+      if not path:find("/subagents/", 1, true) then
+         local session_id = vim.fn.fnamemodify(path, ":t:r")
+         local f = io.open(path, "r")
+         if f then
+            local cwd = ""
+            for line in f:lines() do
+               local entry = decode_json_line(line)
+               if type(entry) == "table" and cwd == "" and type(entry.cwd) == "string" then
+                  cwd = entry.cwd
+               end
+               local role, text, timestamp = extract_claude_search_text(entry)
+               local item = build_chat_search_entry("claude", session_id, cwd, path, role, text, timestamp)
+               if item then entries[#entries + 1] = item end
+            end
+            f:close()
+         end
+      end
+   end
+end
+
+local function collect_chat_search_entries()
+   local entries = {}
+   collect_codex_chat_search_entries(entries)
+   collect_claude_chat_search_entries(entries)
+
+   table.sort(entries, function(a, b)
+      if a.sort_time == b.sort_time then
+         return (a.session_id or "") > (b.session_id or "")
+      end
+      return a.sort_time > b.sort_time
+   end)
+
+   return entries
+end
+
+local function encode_chat_search_line(entry)
+   local fields = {
+      entry.provider or "",
+      entry.session_id or "",
+      entry.cwd or "",
+      entry.transcript_path or "",
+      provider_title(entry.provider or ""),
+      entry.display_time or "",
+      entry.role or "",
+      entry.display_cwd or "",
+      entry.preview or "",
+      entry.text or "",
+   }
+
+   for i, value in ipairs(fields) do
+      fields[i] = normalize_search_text(value) or ""
+   end
+
+   return table.concat(fields, "\t")
+end
+
+local function set_term_heading(term, heading)
+   heading = sanitize_heading(heading)
+   if heading == term.generated_heading then return false end
+   term.generated_heading = heading
+   return refresh_term_name(term)
+end
+
 local function set_term_prompt(term, prompt)
    prompt = sanitize_prompt(prompt)
    if not prompt or prompt == term.last_prompt then return false end
    term.last_prompt = prompt
-   term.name = prompt
-   return true
+   return refresh_term_name(term)
+end
+
+local function get_session_prompt_history(provider, session_id)
+   local store = prompt_history_store(provider)
+   if not store or not session_id then return nil end
+   return store[session_id]
+end
+
+local function get_term_prompt_history(term)
+   return get_session_prompt_history(term.provider, provider_session_id(term))
+end
+
+local function build_heading_context(prompts, max_context_chars)
+   local lines = {}
+
+   if max_context_chars == nil then
+      for i, prompt in ipairs(prompts) do
+         lines[#lines + 1] = string.format("%d. %s", i, prompt)
+      end
+      return table.concat(lines, "\n"), false
+   end
+
+   local total = 0
+   for i = #prompts, 1, -1 do
+      local line = string.format("%d. %s", i, prompts[i])
+      local line_len = #line + 1
+      if #lines > 0 and total + line_len > max_context_chars then
+         break
+      end
+      table.insert(lines, 1, line)
+      total = total + line_len
+   end
+
+   return table.concat(lines, "\n"), #lines < #prompts
+end
+
+local function build_term_heading_request(term)
+   local prompts = get_term_prompt_history(term)
+   local session_id = provider_session_id(term)
+   if not session_id or not prompts or #prompts == 0 then return nil end
+
+   local context, truncated = build_heading_context(prompts, state.auto_heading_opts.max_context_chars)
+   local key = table.concat({
+      term.provider,
+      session_id,
+      tostring(#prompts),
+      prompts[#prompts] or "",
+   }, "\31")
+
+   local prompt = table.concat({
+      "You generate concise Neovim tab headings for long-running AI chat sessions.",
+      'Return JSON only in the exact shape {"heading":"..."} and nothing else.',
+      "Rules:",
+      "- The heading must be 3 to 8 words.",
+      "- Keep it concrete, specific, and scannable.",
+      "- Prefer the actual task over generic words like chat, conversation, or help.",
+      "- If the work narrowed over time, bias toward the latest stable direction.",
+      "- Do not include quotes around the heading value besides valid JSON.",
+      "- Do not end the heading with a period.",
+      "",
+      "Provider: " .. provider_title(term.provider),
+      "Current heading: " .. (term.generated_heading or "none"),
+      truncated and "Note: only the most recent prompts fit inside max_context_chars." or "Note: all recorded prompts are included.",
+      "",
+      "User prompts:",
+      context,
+   }, "\n")
+
+   return {
+      key = key,
+      prompt = prompt,
+   }
+end
+
+local function parse_term_heading_output(output)
+   output = type(output) == "string" and vim.trim(output) or ""
+   if output == "" then return nil end
+
+   local decoded = decode_json(output)
+   if type(decoded) == "table" and type(decoded.heading) == "string" then
+      return sanitize_heading(decoded.heading)
+   end
+
+   local json_blob = output:match("%b{}")
+   decoded = decode_json(json_blob)
+   if type(decoded) == "table" and type(decoded.heading) == "string" then
+      return sanitize_heading(decoded.heading)
+   end
+
+   return sanitize_heading(output)
 end
 
 local function new_state_id()
@@ -226,7 +616,7 @@ local function current_session_path()
    return cmax_sessions_dir .. "/" .. ensure_multiplexer_session_id() .. ".json"
 end
 
-local function provider_title(provider)
+provider_title = function(provider)
    if provider == "codex" then
       return "Codex"
    end
@@ -236,7 +626,7 @@ local function provider_title(provider)
    return provider:gsub("^%l", string.upper)
 end
 
-local function provider_session_id(term)
+provider_session_id = function(term)
    if term.provider == "codex" then
       return term.codex_session_id
    end
@@ -256,7 +646,9 @@ local function build_terminal_snapshot(term)
       provider = term.provider,
       cwd = term.cwd,
       name = term.name,
+      default_name = term.default_name,
       last_prompt = term.last_prompt,
+      generated_heading = term.generated_heading,
       status = term.status,
       session_id = provider_session_id(term),
       transcript_path = term.codex_session_path,
@@ -320,7 +712,7 @@ local function load_saved_sessions()
    return sessions
 end
 
-local function poll_history(path, offset_key, prompt_store, extract)
+local function poll_history(path, offset_key, prompt_store, history_store, extract)
    local stat = vim.uv.fs_stat(path)
    if not stat or stat.type ~= "file" then return false end
 
@@ -329,6 +721,9 @@ local function poll_history(path, offset_key, prompt_store, extract)
       offset = 0
       state[offset_key] = 0
       clear_table(prompt_store)
+      if history_store then
+         clear_table(history_store)
+      end
    end
    if stat.size == offset then return false end
 
@@ -339,11 +734,19 @@ local function poll_history(path, offset_key, prompt_store, extract)
    local changed = false
    for line in f:lines() do
       local entry = decode_json_line(line)
-      local session_id, prompt = extract(entry)
-      prompt = sanitize_prompt(prompt)
-      if session_id and prompt and prompt_store[session_id] ~= prompt then
-         prompt_store[session_id] = prompt
-         changed = true
+      local session_id, raw_prompt = extract(entry)
+      local latest_prompt = sanitize_prompt(raw_prompt)
+      local history_prompt = normalize_search_text(raw_prompt)
+      if session_id and (latest_prompt or history_prompt) then
+         if latest_prompt and prompt_store[session_id] ~= latest_prompt then
+            prompt_store[session_id] = latest_prompt
+            changed = true
+         end
+         if history_store and history_prompt then
+            history_store[session_id] = history_store[session_id] or {}
+            table.insert(history_store[session_id], history_prompt)
+            changed = true
+         end
       end
    end
 
@@ -353,17 +756,29 @@ local function poll_history(path, offset_key, prompt_store, extract)
 end
 
 local function poll_codex_history()
-   return poll_history(codex_history_path, "codex_history_offset", state.codex_latest_prompts, function(entry)
+   return poll_history(
+      codex_history_path,
+      "codex_history_offset",
+      state.codex_latest_prompts,
+      state.codex_prompt_history,
+      function(entry)
       if type(entry) ~= "table" then return nil end
       return entry.session_id, entry.text
-   end)
+   end
+   )
 end
 
 local function poll_claude_history()
-   return poll_history(claude_history_path, "claude_history_offset", state.claude_latest_prompts, function(entry)
+   return poll_history(
+      claude_history_path,
+      "claude_history_offset",
+      state.claude_latest_prompts,
+      state.claude_prompt_history,
+      function(entry)
       if type(entry) ~= "table" then return nil end
       return entry.sessionId or entry.session_id, entry.display
-   end)
+   end
+   )
 end
 
 local function parse_codex_session_started_at(path)
@@ -382,7 +797,7 @@ local function parse_codex_session_started_at(path)
    })
 end
 
-local function get_codex_session_meta(path)
+get_codex_session_meta = function(path)
    local cached = state.codex_session_cache[path]
    if cached then return cached end
 
@@ -805,7 +1220,7 @@ end
 local function session_summary(session)
    local labels = {}
    for i, term in ipairs(session.terminals or {}) do
-      labels[#labels + 1] = term.last_prompt or term.name or (provider_title(term.provider) .. " " .. i)
+      labels[#labels + 1] = term.generated_heading or term.name or term.last_prompt or (provider_title(term.provider) .. " " .. i)
       if #labels == 3 then break end
    end
    return table.concat(labels, " | ")
@@ -877,6 +1292,223 @@ local function find_terminal(cmax_id)
       if term.cmax_id == cmax_id then
          return term
       end
+   end
+end
+
+local function find_terminal_by_session(provider, session_id, transcript_path)
+   for index, term in ipairs(state.terminals) do
+      if term.provider == provider then
+         if provider == "codex" then
+            if (session_id and term.codex_session_id == session_id)
+               or (transcript_path and term.codex_session_path == transcript_path) then
+               return term, index
+            end
+         elseif provider == "claude" and session_id and term.claude_session_id == session_id then
+            return term, index
+         end
+      end
+   end
+end
+
+local function focus_terminal_session(term, index)
+   if not term or not vim.api.nvim_buf_is_valid(term.buf) then return false end
+   local win = ensure_window()
+   state.selected = index or state.selected
+   vim.api.nvim_win_set_buf(win, term.buf)
+   vim.cmd("startinsert")
+   save_current_session()
+   return true
+end
+
+local function open_chat_search_result(provider, session_id, cwd, transcript_path, label)
+   local term, index = find_terminal_by_session(provider, session_id, transcript_path)
+   if focus_terminal_session(term, index) then
+      return
+   end
+
+   local opts = {
+      provider = provider,
+      cwd = cwd ~= "" and cwd or vim.fn.getcwd(),
+      transcript_path = transcript_path,
+      label = label,
+      last_prompt = label,
+      startinsert = true,
+   }
+
+   if session_id and session_id ~= "" then
+      opts.resume = true
+      opts.session_id = session_id
+   end
+
+   ensure_window()
+   local cmd = build_command(opts)
+   create_terminal(cmd, opts)
+   state.selected = #state.terminals
+   save_current_session()
+end
+
+local function open_chat_search_window()
+   local buf = vim.api.nvim_create_buf(false, true)
+   vim.bo[buf].bufhidden = "wipe"
+
+   local width = math.max(80, math.floor(vim.o.columns * 0.9))
+   local height = math.max(20, math.floor((vim.o.lines - vim.o.cmdheight) * 0.8))
+   local row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1)
+   local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+
+   local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      row = row,
+      col = col,
+      width = width,
+      height = height,
+      style = "minimal",
+      border = "rounded",
+      title = " Chat Search ",
+      title_pos = "center",
+   })
+
+   configure_window(win)
+   return buf, win
+end
+
+local function rerender_active_view()
+   if not (state.menu_buf and vim.api.nvim_buf_is_valid(state.menu_buf)) then return end
+   if not (state.win and vim.api.nvim_win_is_valid(state.win)) then return end
+
+   if state.view == "sessions" then
+      render_saved_sessions(state.win)
+   else
+      render_menu(state.win)
+   end
+end
+
+local function schedule_term_heading(term)
+   local opts = state.auto_heading_opts
+   if not opts or not opts.enabled then return end
+   if vim.fn.executable(opts.command[1]) ~= 1 then return end
+
+   local request = build_term_heading_request(term)
+   if not request then return end
+   if term.heading_applied_key == request.key and term.generated_heading then
+      term.heading_dirty = false
+      term.heading_target_key = request.key
+      return
+   end
+
+   if term.heading_target_key ~= request.key then
+      term.heading_target_key = request.key
+      term.heading_due_at = vim.uv.now() + opts.debounce_ms
+      term.heading_dirty = true
+      return
+   end
+
+   if not term.generated_heading and term.heading_requested_key ~= request.key then
+      term.heading_due_at = term.heading_due_at or (vim.uv.now() + opts.debounce_ms)
+      term.heading_dirty = true
+   end
+end
+
+local function start_term_heading_job(term, request)
+   local opts = state.auto_heading_opts
+   local cmd = vim.deepcopy(opts.command)
+
+   table.insert(cmd, "run")
+   table.insert(cmd, opts.model)
+   table.insert(cmd, "--format")
+   table.insert(cmd, "json")
+   table.insert(cmd, "--hidethinking")
+   table.insert(cmd, "--nowordwrap")
+   if opts.keepalive then
+      table.insert(cmd, "--keepalive")
+      table.insert(cmd, opts.keepalive)
+   end
+   table.insert(cmd, request.prompt)
+
+   term.heading_requested_key = request.key
+   term.heading_dirty = false
+   state.active_heading_job = {
+      cmax_id = term.cmax_id,
+      key = request.key,
+   }
+
+   vim.system(cmd, { text = true, timeout = opts.timeout_ms }, function(result)
+      vim.schedule(function()
+         local live_term = find_terminal(term.cmax_id)
+         state.active_heading_job = nil
+
+         if live_term and live_term.heading_requested_key == request.key then
+            live_term.heading_requested_key = nil
+         end
+
+         if result.code == 0 then
+            state.heading_failure_message = nil
+            if live_term and live_term.heading_target_key == request.key then
+               local heading = parse_term_heading_output(result.stdout)
+               if heading and set_term_heading(live_term, heading) then
+                  save_current_session()
+                  rerender_active_view()
+               end
+               live_term.heading_applied_key = request.key
+            elseif live_term then
+               live_term.heading_dirty = true
+               live_term.heading_due_at = vim.uv.now()
+            end
+         else
+            local error_text = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+            if live_term then
+               live_term.heading_dirty = true
+               live_term.heading_due_at = vim.uv.now() + opts.debounce_ms
+            end
+            state.heading_backoff_until = vim.uv.now() + 15000
+            if error_text ~= "" and error_text ~= state.heading_failure_message then
+               state.heading_failure_message = error_text
+               vim.notify("cmax auto headings: " .. error_text, vim.log.levels.WARN)
+            end
+         end
+
+         if not state.active_heading_job and vim.uv.now() >= state.heading_backoff_until then
+            for _, pending_term in ipairs(state.terminals) do
+               schedule_term_heading(pending_term)
+            end
+         end
+
+         pump_term_heading_jobs()
+      end)
+   end)
+end
+
+pump_term_heading_jobs = function()
+   local opts = state.auto_heading_opts
+   if not opts or not opts.enabled then return end
+   if state.active_heading_job then return end
+   if vim.uv.now() < (state.heading_backoff_until or 0) then return end
+   if vim.fn.executable(opts.command[1]) ~= 1 then return end
+
+   local best_term
+   local best_request
+   local best_due
+   local now = vim.uv.now()
+
+   for _, term in ipairs(state.terminals) do
+      if term.heading_dirty and term.heading_target_key
+         and term.heading_requested_key ~= term.heading_target_key then
+         local due_at = term.heading_due_at or 0
+         if due_at <= now then
+            local request = build_term_heading_request(term)
+            if request and request.key == term.heading_target_key then
+               if not best_due or due_at < best_due then
+                  best_term = term
+                  best_request = request
+                  best_due = due_at
+               end
+            end
+         end
+      end
+   end
+
+   if best_term and best_request then
+      start_term_heading_job(best_term, best_request)
    end
 end
 
@@ -1104,6 +1736,7 @@ local function create_terminal(cmd, opts)
       job_id = job_id,
       pid = vim.fn.jobpid(job_id),
       name = name,
+      default_name = name,
       cmax_id = cmax_id,
       provider = provider,
       cwd = cwd,
@@ -1125,6 +1758,11 @@ local function create_terminal(cmd, opts)
    end
    if opts.last_prompt then
       set_term_prompt(term, opts.last_prompt)
+   end
+   if opts.generated_heading then
+      set_term_heading(term, opts.generated_heading)
+   else
+      refresh_term_name(term)
    end
 
    setup_term_keymaps(term_buf)
@@ -1171,8 +1809,9 @@ local function restore_snapshot(snapshot)
       local opts = {
          provider = item.provider or "claude",
          cwd = item.cwd or snapshot.cwd or vim.fn.getcwd(),
-         label = item.last_prompt or item.name,
+         label = item.default_name or item.last_prompt or item.name,
          last_prompt = item.last_prompt,
+         generated_heading = item.generated_heading,
          status = item.status,
          dangerously = item.dangerously,
          profile = item.profile,
@@ -1215,6 +1854,76 @@ local function restore_saved_session(index)
    open_confirmation_popup("REPLACE current multiplexer session", "Replace", "Cancel", do_restore)
 end
 
+show_chat_search = function()
+   local fzf = vim.fn.exepath("fzf")
+   if fzf == "" then
+      vim.notify("cmax: fzf is not installed", vim.log.levels.ERROR)
+      return
+   end
+
+   local entries = collect_chat_search_entries()
+   if #entries == 0 then
+      vim.notify("cmax: no chat history found", vim.log.levels.INFO)
+      return
+   end
+
+   local lines = {}
+   for _, entry in ipairs(entries) do
+      lines[#lines + 1] = encode_chat_search_line(entry)
+   end
+
+   local input_path = vim.fn.tempname()
+   local output_path = vim.fn.tempname()
+   if not write_file(input_path, table.concat(lines, "\n")) then
+      vim.notify("cmax: failed to build chat search index", vim.log.levels.ERROR)
+      return
+   end
+
+   local buf, win = open_chat_search_window()
+   local cmd = string.format(
+      "cat %s | %s --layout=reverse --info=inline --tiebreak=index --prompt=%s --header=%s --delimiter='\\t' --with-nth='5,6,7,8,9' --nth='5,6,7,8,9,10' --bind='ctrl-s:toggle-sort' > %s",
+      vim.fn.shellescape(input_path),
+      vim.fn.shellescape(fzf),
+      vim.fn.shellescape("Chats> "),
+      vim.fn.shellescape("Enter to resume the thread, ESC to cancel"),
+      vim.fn.shellescape(output_path)
+   )
+
+   vim.fn.termopen({ vim.o.shell, vim.o.shellcmdflag, cmd }, {
+      on_exit = function()
+         vim.schedule(function()
+            local selection = read_file(output_path)
+
+            os.remove(input_path)
+            os.remove(output_path)
+
+            if vim.api.nvim_win_is_valid(win) then
+               vim.api.nvim_win_close(win, true)
+            end
+
+            if vim.api.nvim_buf_is_valid(buf) then
+               pcall(vim.api.nvim_buf_delete, buf, { force = true })
+            end
+
+            selection = selection and vim.trim(selection) or ""
+            if selection == "" then return end
+
+            local fields = vim.split(selection, "\t", { plain = true, trimempty = false })
+            local provider = fields[1]
+            local session_id = fields[2]
+            local cwd = fields[3] or ""
+            local transcript_path = fields[4] or ""
+            local label = fields[9] or ""
+
+            if provider ~= "codex" and provider ~= "claude" then return end
+            open_chat_search_result(provider, session_id, cwd, transcript_path, label)
+         end)
+      end,
+   })
+
+   vim.cmd("startinsert")
+end
+
 show_saved_sessions = function(opts)
    opts = opts or {}
    local win = ensure_window()
@@ -1244,6 +1953,7 @@ show_saved_sessions = function(opts)
    vim.keymap.set("n", "<CR>", function()
       restore_saved_session(state.selected)
    end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "f", show_chat_search, { buffer = buf, nowait = true })
    vim.keymap.set("n", "q", function()
       if state.session_picker_return_to_menu and state.win and vim.api.nvim_win_is_valid(state.win) then
          show_menu()
@@ -1306,6 +2016,7 @@ show_menu = function()
    vim.keymap.set("n", "R", function()
       show_saved_sessions({ return_to_menu = true })
    end, { buffer = buf, nowait = true })
+   vim.keymap.set("n", "f", show_chat_search, { buffer = buf, nowait = true })
    for key, profile in pairs(state.launch_profiles) do
       vim.keymap.set("n", key, function()
          if state.selected > #state.terminals then
@@ -1380,7 +2091,11 @@ local function poll_statuses()
       if prompt and set_term_prompt(term, prompt) then
          changed = true
       end
+
+      schedule_term_heading(term)
    end
+
+   pump_term_heading_jobs()
 
    if not changed then return end
 
@@ -1402,6 +2117,7 @@ end
 function M.setup(opts)
    opts = opts or {}
    state.launch_profiles = normalize_launch_profiles(opts.launch_profiles)
+   state.auto_heading_opts = normalize_auto_heading_opts(opts.auto_headings)
 
    install_hooks()
    pcall(vim.fn.mkdir, cmax_sessions_dir, "p")
@@ -1434,6 +2150,8 @@ function M.setup(opts)
       local return_to_menu = state.win and vim.api.nvim_win_is_valid(state.win)
       show_saved_sessions({ return_to_menu = return_to_menu })
    end)
+
+   vim.keymap.set("n", "<Leader>cf", show_chat_search)
 end
 
 return M

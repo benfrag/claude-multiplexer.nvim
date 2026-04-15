@@ -12,3 +12,4 @@ WRN 2026-04-13T11:54:05.070 c/nvim.52976.0 server_start:199: Failed to start ser
 WRN 2026-04-13T11:57:31.097 c/nvim.56860.0 server_start:199: Failed to start server: operation not permitted: /var/folders/4s/rvgfh9hx6tj_vw91fr8prqr40000gn/T/nvim.ben/5Wu34P/nvim.57165.0
 WRN 2026-04-13T11:57:31.099 c/nvim.56860.0 server_start:199: Failed to start server: operation not permitted: /var/folders/4s/rvgfh9hx6tj_vw91fr8prqr40000gn/T/nvim.ben/YvCOBr/nvim.57166.0
 WRN 2026-04-13T11:58:10.997 c/nvim.56860.0 server_start:199: Failed to start server: operation not permitted: /var/folders/4s/rvgfh9hx6tj_vw91fr8prqr40000gn/T/nvim.ben/UOB900/nvim.57289.0
+WRN 2026-04-15T12:28:46.039 c/nvim.65694.0 server_start:199: Failed to start server: operation not permitted: /var/folders/4s/rvgfh9hx6tj_vw91fr8prqr40000gn/T/nvim.ben/tKD7aH/nvim.80591.0

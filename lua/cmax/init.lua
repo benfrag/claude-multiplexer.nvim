@@ -178,6 +178,7 @@ local provider_title
 local provider_session_id
 local pump_term_heading_jobs
 local find_terminal
+local rerender_active_view
 
 local function read_file(path)
    local f = io.open(path, "r")
@@ -782,6 +783,14 @@ local function collect_term_transcript_lines(term, max_chars)
       push_limited_lines(lines, text, max_chars)
    end
 
+   local prompts = get_term_prompt_history(term) or {}
+   if #prompts > 0 then
+      for _, prompt in ipairs(prompts) do
+         append(prompt)
+      end
+      return lines
+   end
+
    if term.provider == "codex" then
       local path = term.codex_session_path
       if path and path ~= "" then
@@ -810,13 +819,6 @@ local function collect_term_transcript_lines(term, max_chars)
             end
             f:close()
          end
-      end
-   end
-
-   if #lines == 0 then
-      local prompts = get_term_prompt_history(term) or {}
-      for _, prompt in ipairs(prompts) do
-         append(prompt)
       end
    end
 
@@ -2075,7 +2077,7 @@ local function open_chat_search_window()
    return buf, win
 end
 
-local function rerender_active_view()
+rerender_active_view = function()
    if not (state.menu_buf and vim.api.nvim_buf_is_valid(state.menu_buf)) then return end
    if not (state.win and vim.api.nvim_win_is_valid(state.win)) then return end
 

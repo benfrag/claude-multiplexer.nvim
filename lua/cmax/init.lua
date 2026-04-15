@@ -41,6 +41,9 @@ local state = {
    tab_filter_loading = false,
    tab_filter_error = nil,
    tab_filter_return_selected = nil,
+   tab_filter_progress_done = 0,
+   tab_filter_progress_total = 0,
+   tab_filter_failure_count = 0,
 }
 
 local status_dir = (vim.env.TMPDIR or "/tmp") .. "/cmax-status"
@@ -286,8 +289,9 @@ local function normalize_tab_filter_opts(opts)
       debounce_ms = 0,
       keepalive = "2m",
       timeout_ms = 45000,
-      max_context_chars_per_tab = 12000,
+      max_context_chars_per_tab = nil,
       max_reason_chars = 90,
+      parallel_jobs = 4,
    }
 
    opts = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -300,8 +304,16 @@ local function normalize_tab_filter_opts(opts)
    opts.enabled = not not opts.enabled
    opts.debounce_ms = math.max(0, tonumber(opts.debounce_ms) or defaults.debounce_ms)
    opts.timeout_ms = math.max(1000, tonumber(opts.timeout_ms) or defaults.timeout_ms)
-   opts.max_context_chars_per_tab = math.max(1000, tonumber(opts.max_context_chars_per_tab) or defaults.max_context_chars_per_tab)
+   if opts.max_context_chars_per_tab ~= nil then
+      local max_context_chars_per_tab = tonumber(opts.max_context_chars_per_tab)
+      if max_context_chars_per_tab then
+         opts.max_context_chars_per_tab = math.max(1000, max_context_chars_per_tab)
+      else
+         opts.max_context_chars_per_tab = defaults.max_context_chars_per_tab
+      end
+   end
    opts.max_reason_chars = math.max(20, tonumber(opts.max_reason_chars) or defaults.max_reason_chars)
+   opts.parallel_jobs = math.max(1, tonumber(opts.parallel_jobs) or defaults.parallel_jobs)
    if opts.keepalive == false or opts.keepalive == "" then
       opts.keepalive = nil
    elseif opts.keepalive ~= nil then
@@ -624,8 +636,25 @@ local function build_term_heading_request(term)
    }
 end
 
+local function strip_terminal_control_sequences(text)
+   if type(text) ~= "string" or text == "" then return "" end
+   text = text:gsub("\r", "")
+   text = text:gsub("\27%[[0-?]*[ -/]*[@-~]", "")
+   text = text:gsub("\27%][^\7]*\7", "")
+   text = text:gsub("\27%].-\27\\", "")
+   text = text:gsub("\27P.-\27\\", "")
+   text = text:gsub("\226\160[\128-\191]", "")
+   text = text:gsub("\226\161[\128-\191]", "")
+   text = text:gsub("[%z\1-\8\11-\12\14-\31\127]", " ")
+   return text
+end
+
+local function clean_model_output(text)
+   return vim.trim(strip_terminal_control_sequences(text))
+end
+
 local function parse_term_heading_output(output)
-   output = type(output) == "string" and vim.trim(output) or ""
+   output = clean_model_output(output)
    if output == "" then return nil end
 
    local decoded = decode_json(output)
@@ -648,6 +677,12 @@ local function shorten_text_middle(text, max_len)
    local head = math.floor((max_len - 3) / 2)
    local tail = max_len - 3 - head
    return text:sub(1, head) .. "..." .. text:sub(#text - tail + 1)
+end
+
+local function clean_model_error(text)
+   text = normalize_search_text(clean_model_output(text))
+   if not text then return nil end
+   return shorten_text_middle(text, 240)
 end
 
 local function push_limited_lines(lines, line, max_chars)
@@ -749,11 +784,10 @@ local function build_tab_filter_candidates()
    return candidates
 end
 
-local function build_tab_filter_prompt(query, candidates)
-   local tabs = {}
-   for _, candidate in ipairs(candidates) do
-      tabs[#tabs + 1] = {
-         tab_index = candidate.tab_index,
+local function build_tab_filter_prompt(query, candidate)
+   local payload = {
+      query = query,
+      tab = {
          provider = candidate.provider,
          heading = candidate.heading,
          last_prompt = candidate.last_prompt,
@@ -761,42 +795,57 @@ local function build_tab_filter_prompt(query, candidates)
          cwd = candidate.cwd,
          session_id = candidate.session_id,
          transcript = candidate.transcript,
-      }
-   end
-
-   local payload = {
-      query = query,
-      tabs = tabs,
+      },
    }
 
    return table.concat({
-      "You filter open Neovim chat tabs by semantic relevance.",
-      'Return JSON only in the exact shape {"matches":[{"tab_index":1,"score":0.0,"reason":"..."}]}.',
+      "You evaluate whether a single open Neovim chat tab matches a semantic query.",
+      'Return JSON only in the exact shape {"match":true,"score":0.0,"reason":"..."} and nothing else.',
       "Rules:",
-      "- Consider the full tab transcript, heading, last prompt, provider, status, and cwd.",
-      "- Include only tabs that are genuinely relevant to the query.",
-      "- score must be between 0 and 1.",
-      "- Sort matches from most relevant to least relevant.",
+      "- Consider the tab heading, last prompt, provider, status, cwd, and the full transcript.",
+      "- match must be true or false.",
+      "- If the tab is not relevant, set match=false and score=0.",
+      "- If the tab is relevant, set match=true and score between 0 and 1.",
       "- reason must be a very short phrase, not a sentence.",
-      "- If nothing matches, return an empty matches array.",
       "",
       vim.json.encode(payload),
    }, "\n")
 end
 
 local function parse_tab_filter_output(output)
-   output = type(output) == "string" and vim.trim(output) or ""
-   if output == "" then return {}, true end
+   output = clean_model_output(output)
+   if output == "" then return nil, false end
 
    local decoded = decode_json(output)
    if type(decoded) ~= "table" then
       decoded = decode_json(output:match("%b{}"))
    end
-   if type(decoded) ~= "table" or not vim.islist(decoded.matches) then
+   if type(decoded) ~= "table" then
       return nil, false
    end
 
-   return decoded.matches, true
+   local is_match = decoded.match
+   if type(is_match) == "string" then
+      is_match = is_match == "true"
+   end
+   if type(is_match) ~= "boolean" then
+      return nil, false
+   end
+
+   local score = tonumber(decoded.score) or 0
+   if not is_match then
+      score = 0
+   elseif score < 0 then
+      score = 0
+   elseif score > 1 then
+      score = 1
+   end
+
+   return {
+      match = is_match,
+      score = score,
+      reason = normalize_search_text(decoded.reason) or (is_match and "semantic match" or "not relevant"),
+   }, true
 end
 
 local function new_state_id()
@@ -1496,15 +1545,19 @@ local function render_filtered_terminals(win)
    state.status_lines = {}
 
    if state.tab_filter_loading then
+      local progress = string.format("%d/%d tabs checked", state.tab_filter_progress_done or 0, state.tab_filter_progress_total or 0)
+      if (state.tab_filter_failure_count or 0) > 0 then
+         progress = progress .. string.format("  %d failed", state.tab_filter_failure_count)
+      end
       table.insert(lines, top)
-      table.insert(lines, pad_line("Filtering tabs...", inner_width))
+      table.insert(lines, pad_line("Filtering tabs... " .. progress, inner_width))
       table.insert(lines, pad_line(state.tab_filter_query or "", inner_width))
       table.insert(lines, pad_line("Press q or <Esc> to go back", inner_width))
       table.insert(lines, bottom)
    elseif state.tab_filter_error then
       table.insert(lines, top)
       table.insert(lines, pad_line("Tab filter failed", inner_width))
-      table.insert(lines, pad_line(state.tab_filter_error, inner_width))
+      table.insert(lines, pad_line(shorten_text_middle(state.tab_filter_error, inner_width), inner_width))
       table.insert(lines, pad_line("Press s to try again, q to go back", inner_width))
       table.insert(lines, bottom)
    elseif #state.filtered_terminals == 0 then
@@ -1617,11 +1670,21 @@ local function focus_terminal_session(term, index)
 end
 
 local function close_tab_filter_view()
+   if state.active_tab_filter_job and state.active_tab_filter_job.handles then
+      for _, handle in pairs(state.active_tab_filter_job.handles) do
+         pcall(function()
+            handle:kill(15)
+         end)
+      end
+   end
    state.active_tab_filter_job = nil
    state.tab_filter_loading = false
    state.tab_filter_error = nil
    state.filtered_terminals = {}
    state.tab_filter_query = nil
+   state.tab_filter_progress_done = 0
+   state.tab_filter_progress_total = 0
+   state.tab_filter_failure_count = 0
 
    local selected = state.tab_filter_return_selected
    if selected then
@@ -1698,59 +1761,144 @@ local function ensure_filter_view()
    return buf, win
 end
 
-local function normalize_filter_score(value)
-   local score = tonumber(value) or 0
-   if score < 0 then return 0 end
-   if score > 1 then return 1 end
-   return score
-end
-
-local function build_filtered_tab_items(matches, candidates)
+local function build_filtered_tab_items(results)
    local opts = state.tab_filter_opts or {}
    local max_reason_chars = opts.max_reason_chars or 90
-   local by_index = {}
    local items = {}
-   local seen = {}
 
-   for _, candidate in ipairs(candidates or {}) do
-      by_index[candidate.tab_index] = candidate
-   end
-
-   for ordinal, match in ipairs(matches or {}) do
-      if type(match) == "table" then
-         local tab_index = tonumber(match.tab_index)
-         local candidate = tab_index and by_index[tab_index] or nil
-         if candidate and not seen[tab_index] then
-            seen[tab_index] = true
-            local score = normalize_filter_score(match.score)
-            local reason = normalize_search_text(match.reason) or "semantic match"
-            items[#items + 1] = {
-               cmax_id = candidate.cmax_id,
-               tab_index = candidate.tab_index,
-               heading = candidate.heading,
-               reason = truncate_text(reason, max_reason_chars),
-               score = score,
-               display_score = string.format("match %.0f%%", score * 100),
-               status = candidate.status or "",
-               display_cwd = shorten_path(candidate.cwd or ""),
-               ordinal = ordinal,
-            }
-         end
+   for _, result in ipairs(results or {}) do
+      if result.match and result.candidate then
+         local candidate = result.candidate
+         local score = tonumber(result.score) or 0
+         if score < 0 then score = 0 end
+         if score > 1 then score = 1 end
+         items[#items + 1] = {
+            cmax_id = candidate.cmax_id,
+            tab_index = candidate.tab_index,
+            heading = candidate.heading,
+            reason = truncate_text(result.reason or "semantic match", max_reason_chars),
+            score = score,
+            display_score = string.format("match %.0f%%", score * 100),
+            status = candidate.status or "",
+            display_cwd = shorten_path(candidate.cwd or ""),
+         }
       end
    end
 
    table.sort(items, function(a, b)
       if a.score == b.score then
-         return a.ordinal < b.ordinal
+         return a.tab_index < b.tab_index
       end
       return a.score > b.score
    end)
 
-   for _, item in ipairs(items) do
-      item.ordinal = nil
+   return items
+end
+
+local function build_tab_filter_command(prompt)
+   local opts = state.tab_filter_opts or {}
+   local model = opts.model
+      or (state.auto_heading_opts and state.auto_heading_opts.model)
+      or "qwen2.5:1.5b"
+   local cmd = vim.deepcopy(opts.command)
+
+   table.insert(cmd, "run")
+   table.insert(cmd, model)
+   table.insert(cmd, "--format")
+   table.insert(cmd, "json")
+   table.insert(cmd, "--hidethinking")
+   table.insert(cmd, "--nowordwrap")
+   if opts.keepalive then
+      table.insert(cmd, "--keepalive")
+      table.insert(cmd, opts.keepalive)
+   end
+   table.insert(cmd, prompt)
+
+   return cmd
+end
+
+local function finalize_tab_filter_request(request)
+   if not state.active_tab_filter_job or state.active_tab_filter_job.id ~= request.id then
+      return
    end
 
-   return items
+   state.active_tab_filter_job = nil
+   state.tab_filter_loading = false
+
+   local items = build_filtered_tab_items(request.results)
+   if #items > 0 then
+      show_tab_filter_results(items, request.query)
+      return
+   end
+
+   if request.failure_count > 0 then
+      local summary = string.format("%d/%d tabs failed", request.failure_count, request.total)
+      if request.last_error then
+         summary = summary .. ": " .. request.last_error
+      end
+      show_tab_filter_results({}, request.query, { error = summary })
+      return
+   end
+
+   show_tab_filter_results({}, request.query)
+end
+
+local function pump_tab_filter_jobs(request)
+   if not state.active_tab_filter_job or state.active_tab_filter_job.id ~= request.id then
+      return
+   end
+
+   local opts = state.tab_filter_opts or {}
+   local max_running = math.max(1, math.min(opts.parallel_jobs or 1, request.total))
+
+   while request.running < max_running and request.next_index <= request.total do
+      local candidate = request.candidates[request.next_index]
+      request.next_index = request.next_index + 1
+      request.running = request.running + 1
+
+      local handle = vim.system(build_tab_filter_command(build_tab_filter_prompt(request.query, candidate)), {
+         text = true,
+         timeout = opts.timeout_ms,
+      }, function(result)
+         vim.schedule(function()
+            if not state.active_tab_filter_job or state.active_tab_filter_job.id ~= request.id then
+               return
+            end
+
+            request.running = request.running - 1
+            request.completed = request.completed + 1
+            state.tab_filter_progress_done = request.completed
+
+            if result.code == 0 then
+               local parsed, ok = parse_tab_filter_output(result.stdout)
+               if ok then
+                  request.results[#request.results + 1] = vim.tbl_extend("force", parsed, {
+                     candidate = candidate,
+                  })
+               else
+                  request.failure_count = request.failure_count + 1
+                  request.last_error = clean_model_error(result.stdout) or "model returned invalid JSON"
+                  state.tab_filter_failure_count = request.failure_count
+               end
+            else
+               request.failure_count = request.failure_count + 1
+               request.last_error = clean_model_error(result.stderr ~= "" and result.stderr or result.stdout or "") or "model request failed"
+               state.tab_filter_failure_count = request.failure_count
+            end
+
+            if request.completed >= request.total then
+               finalize_tab_filter_request(request)
+            else
+               if state.view == "filter" then
+                  rerender_active_view()
+               end
+               pump_tab_filter_jobs(request)
+            end
+         end)
+      end)
+
+      request.handles[#request.handles + 1] = handle
+   end
 end
 
 show_tab_filter_results = function(items, query, opts)
@@ -1763,7 +1911,7 @@ show_tab_filter_results = function(items, query, opts)
    state.filtered_terminals = items or {}
    state.tab_filter_query = query
    state.tab_filter_loading = not not opts.loading
-   state.tab_filter_error = opts.error and normalize_search_text(opts.error) or nil
+   state.tab_filter_error = opts.error and clean_model_error(opts.error) or nil
    state.selected = 1
 
    local _, win = ensure_filter_view()
@@ -1782,10 +1930,6 @@ prompt_tab_filter = function()
       return
    end
 
-   local model = opts.model
-      or (state.auto_heading_opts and state.auto_heading_opts.model)
-      or "qwen2.5:1.5b"
-
    vim.ui.input({
       prompt = "Filter tabs> ",
       default = state.tab_filter_query or "",
@@ -1799,53 +1943,33 @@ prompt_tab_filter = function()
          return
       end
 
+      if state.active_tab_filter_job and state.active_tab_filter_job.handles then
+         for _, handle in pairs(state.active_tab_filter_job.handles) do
+            pcall(function()
+               handle:kill(15)
+            end)
+         end
+      end
+
       local request = {
          id = tostring(vim.uv.hrtime()),
          query = query,
+         candidates = candidates,
+         total = #candidates,
+         next_index = 1,
+         running = 0,
+         completed = 0,
+         failure_count = 0,
+         last_error = nil,
+         results = {},
+         handles = {},
       }
       state.active_tab_filter_job = request
+      state.tab_filter_progress_done = 0
+      state.tab_filter_progress_total = #candidates
+      state.tab_filter_failure_count = 0
       show_tab_filter_results({}, query, { loading = true })
-
-      local cmd = vim.deepcopy(opts.command)
-      table.insert(cmd, "run")
-      table.insert(cmd, model)
-      table.insert(cmd, "--format")
-      table.insert(cmd, "json")
-      table.insert(cmd, "--hidethinking")
-      table.insert(cmd, "--nowordwrap")
-      if opts.keepalive then
-         table.insert(cmd, "--keepalive")
-         table.insert(cmd, opts.keepalive)
-      end
-      table.insert(cmd, build_tab_filter_prompt(query, candidates))
-
-      vim.system(cmd, { text = true, timeout = opts.timeout_ms }, function(result)
-         vim.schedule(function()
-            if not state.active_tab_filter_job or state.active_tab_filter_job.id ~= request.id then
-               return
-            end
-
-            state.active_tab_filter_job = nil
-
-            if result.code ~= 0 then
-               local error_text = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
-               show_tab_filter_results({}, query, {
-                  error = error_text ~= "" and error_text or "model request failed",
-               })
-               return
-            end
-
-            local matches, ok = parse_tab_filter_output(result.stdout)
-            if not ok then
-               show_tab_filter_results({}, query, {
-                  error = "model returned invalid JSON",
-               })
-               return
-            end
-
-            show_tab_filter_results(build_filtered_tab_items(matches, candidates), query)
-         end)
-      end)
+      pump_tab_filter_jobs(request)
    end)
 end
 
@@ -1986,7 +2110,7 @@ local function start_term_heading_job(term, request)
                live_term.heading_due_at = vim.uv.now()
             end
          else
-            local error_text = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+            local error_text = clean_model_error(result.stderr ~= "" and result.stderr or result.stdout or "")
             if live_term then
                live_term.heading_dirty = true
                live_term.heading_due_at = vim.uv.now() + opts.debounce_ms

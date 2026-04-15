@@ -248,11 +248,13 @@ local function normalize_auto_heading_opts(opts)
    local defaults = {
       enabled = true,
       command = { "ollama" },
+      host = "http://127.0.0.1:11434",
       model = "qwen2.5:1.5b",
       debounce_ms = 1500,
       keepalive = "2m",
       timeout_ms = 30000,
       max_context_chars = nil,
+      max_output_tokens = 24,
    }
 
    opts = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -265,6 +267,7 @@ local function normalize_auto_heading_opts(opts)
    opts.enabled = not not opts.enabled
    opts.debounce_ms = math.max(0, tonumber(opts.debounce_ms) or defaults.debounce_ms)
    opts.timeout_ms = math.max(1000, tonumber(opts.timeout_ms) or defaults.timeout_ms)
+   opts.host = tostring(opts.host or defaults.host):gsub("/+$", "")
    if opts.max_context_chars ~= nil then
       local max_context_chars = tonumber(opts.max_context_chars)
       if max_context_chars then
@@ -273,6 +276,7 @@ local function normalize_auto_heading_opts(opts)
          opts.max_context_chars = defaults.max_context_chars
       end
    end
+   opts.max_output_tokens = math.max(8, tonumber(opts.max_output_tokens) or defaults.max_output_tokens)
    if opts.keepalive == false or opts.keepalive == "" then
       opts.keepalive = nil
    elseif opts.keepalive ~= nil then
@@ -285,6 +289,7 @@ local function normalize_tab_filter_opts(opts)
    local defaults = {
       enabled = true,
       command = { "ollama" },
+      host = "http://127.0.0.1:11434",
       model = "qwen2.5:3b",
       debounce_ms = 0,
       keepalive = "2m",
@@ -292,6 +297,7 @@ local function normalize_tab_filter_opts(opts)
       max_context_chars_per_tab = nil,
       max_reason_chars = 90,
       parallel_jobs = 4,
+      max_output_tokens = 32,
    }
 
    opts = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -304,6 +310,7 @@ local function normalize_tab_filter_opts(opts)
    opts.enabled = not not opts.enabled
    opts.debounce_ms = math.max(0, tonumber(opts.debounce_ms) or defaults.debounce_ms)
    opts.timeout_ms = math.max(1000, tonumber(opts.timeout_ms) or defaults.timeout_ms)
+   opts.host = tostring(opts.host or defaults.host):gsub("/+$", "")
    if opts.max_context_chars_per_tab ~= nil then
       local max_context_chars_per_tab = tonumber(opts.max_context_chars_per_tab)
       if max_context_chars_per_tab then
@@ -314,6 +321,7 @@ local function normalize_tab_filter_opts(opts)
    end
    opts.max_reason_chars = math.max(20, tonumber(opts.max_reason_chars) or defaults.max_reason_chars)
    opts.parallel_jobs = math.max(1, tonumber(opts.parallel_jobs) or defaults.parallel_jobs)
+   opts.max_output_tokens = math.max(8, tonumber(opts.max_output_tokens) or defaults.max_output_tokens)
    if opts.keepalive == false or opts.keepalive == "" then
       opts.keepalive = nil
    elseif opts.keepalive ~= nil then
@@ -683,6 +691,60 @@ local function clean_model_error(text)
    text = normalize_search_text(clean_model_output(text))
    if not text then return nil end
    return shorten_text_middle(text, 240)
+end
+
+local function build_ollama_generate_command(model, prompt, opts)
+   local body = {
+      model = model,
+      prompt = prompt,
+      stream = false,
+      format = "json",
+      think = false,
+   }
+
+   if opts.keepalive then
+      body.keep_alive = opts.keepalive
+   end
+
+   body.options = {
+      temperature = 0,
+      num_predict = opts.max_output_tokens,
+   }
+
+   return {
+      "curl",
+      "-sS",
+      "--fail-with-body",
+      "-X",
+      "POST",
+      (opts.host or "http://127.0.0.1:11434") .. "/api/generate",
+      "-H",
+      "Content-Type: application/json",
+      "-d",
+      vim.json.encode(body),
+   }
+end
+
+local function parse_ollama_generate_output(output)
+   output = clean_model_output(output)
+   if output == "" then
+      return nil, "empty response from ollama"
+   end
+
+   local decoded = decode_json(output)
+   if type(decoded) ~= "table" then
+      return nil, "invalid response from ollama"
+   end
+
+   if type(decoded.error) == "string" and decoded.error ~= "" then
+      return nil, decoded.error
+   end
+
+   if type(decoded.response) ~= "string" then
+      return nil, "missing response from ollama"
+   end
+
+   return decoded.response
 end
 
 local function push_limited_lines(lines, line, max_chars)
@@ -1544,7 +1606,7 @@ local function render_filtered_terminals(win)
    local lines = {}
    state.status_lines = {}
 
-   if state.tab_filter_loading then
+   if state.tab_filter_loading and #state.filtered_terminals == 0 then
       local progress = string.format("%d/%d tabs checked", state.tab_filter_progress_done or 0, state.tab_filter_progress_total or 0)
       if (state.tab_filter_failure_count or 0) > 0 then
          progress = progress .. string.format("  %d failed", state.tab_filter_failure_count)
@@ -1795,28 +1857,6 @@ local function build_filtered_tab_items(results)
    return items
 end
 
-local function build_tab_filter_command(prompt)
-   local opts = state.tab_filter_opts or {}
-   local model = opts.model
-      or (state.auto_heading_opts and state.auto_heading_opts.model)
-      or "qwen2.5:1.5b"
-   local cmd = vim.deepcopy(opts.command)
-
-   table.insert(cmd, "run")
-   table.insert(cmd, model)
-   table.insert(cmd, "--format")
-   table.insert(cmd, "json")
-   table.insert(cmd, "--hidethinking")
-   table.insert(cmd, "--nowordwrap")
-   if opts.keepalive then
-      table.insert(cmd, "--keepalive")
-      table.insert(cmd, opts.keepalive)
-   end
-   table.insert(cmd, prompt)
-
-   return cmd
-end
-
 local function finalize_tab_filter_request(request)
    if not state.active_tab_filter_job or state.active_tab_filter_job.id ~= request.id then
       return
@@ -1856,7 +1896,7 @@ local function pump_tab_filter_jobs(request)
       request.next_index = request.next_index + 1
       request.running = request.running + 1
 
-      local handle = vim.system(build_tab_filter_command(build_tab_filter_prompt(request.query, candidate)), {
+      local handle = vim.system(build_ollama_generate_command(request.model, build_tab_filter_prompt(request.query, candidate), opts), {
          text = true,
          timeout = opts.timeout_ms,
       }, function(result)
@@ -1870,14 +1910,21 @@ local function pump_tab_filter_jobs(request)
             state.tab_filter_progress_done = request.completed
 
             if result.code == 0 then
-               local parsed, ok = parse_tab_filter_output(result.stdout)
+               local response_text, response_error = parse_ollama_generate_output(result.stdout)
+               local parsed, ok
+               if response_text then
+                  parsed, ok = parse_tab_filter_output(response_text)
+               else
+                  parsed, ok = nil, false
+               end
                if ok then
                   request.results[#request.results + 1] = vim.tbl_extend("force", parsed, {
                      candidate = candidate,
                   })
+                  state.filtered_terminals = build_filtered_tab_items(request.results)
                else
                   request.failure_count = request.failure_count + 1
-                  request.last_error = clean_model_error(result.stdout) or "model returned invalid JSON"
+                  request.last_error = clean_model_error(response_error or result.stdout) or "model returned invalid JSON"
                   state.tab_filter_failure_count = request.failure_count
                end
             else
@@ -1925,8 +1972,8 @@ prompt_tab_filter = function()
       return
    end
 
-   if vim.fn.executable(opts.command[1]) ~= 1 then
-      vim.notify("cmax: tab filter command is not available: " .. opts.command[1], vim.log.levels.ERROR)
+   if vim.fn.executable("curl") ~= 1 then
+      vim.notify("cmax: curl is required for the tab filter", vim.log.levels.ERROR)
       return
    end
 
@@ -1954,6 +2001,9 @@ prompt_tab_filter = function()
       local request = {
          id = tostring(vim.uv.hrtime()),
          query = query,
+         model = opts.model
+            or (state.auto_heading_opts and state.auto_heading_opts.model)
+            or "qwen2.5:1.5b",
          candidates = candidates,
          total = #candidates,
          next_index = 1,
@@ -2041,7 +2091,7 @@ end
 local function schedule_term_heading(term)
    local opts = state.auto_heading_opts
    if not opts or not opts.enabled then return end
-   if vim.fn.executable(opts.command[1]) ~= 1 then return end
+   if vim.fn.executable("curl") ~= 1 then return end
 
    local request = build_term_heading_request(term)
    if not request then return end
@@ -2066,20 +2116,6 @@ end
 
 local function start_term_heading_job(term, request)
    local opts = state.auto_heading_opts
-   local cmd = vim.deepcopy(opts.command)
-
-   table.insert(cmd, "run")
-   table.insert(cmd, opts.model)
-   table.insert(cmd, "--format")
-   table.insert(cmd, "json")
-   table.insert(cmd, "--hidethinking")
-   table.insert(cmd, "--nowordwrap")
-   if opts.keepalive then
-      table.insert(cmd, "--keepalive")
-      table.insert(cmd, opts.keepalive)
-   end
-   table.insert(cmd, request.prompt)
-
    term.heading_requested_key = request.key
    term.heading_dirty = false
    state.active_heading_job = {
@@ -2087,7 +2123,7 @@ local function start_term_heading_job(term, request)
       key = request.key,
    }
 
-   vim.system(cmd, { text = true, timeout = opts.timeout_ms }, function(result)
+   vim.system(build_ollama_generate_command(opts.model, request.prompt, opts), { text = true, timeout = opts.timeout_ms }, function(result)
       vim.schedule(function()
          local live_term = find_terminal(term.cmax_id)
          state.active_heading_job = nil
@@ -2097,17 +2133,31 @@ local function start_term_heading_job(term, request)
          end
 
          if result.code == 0 then
-            state.heading_failure_message = nil
-            if live_term and live_term.heading_target_key == request.key then
-               local heading = parse_term_heading_output(result.stdout)
+            local response_text, parse_error = parse_ollama_generate_output(result.stdout)
+            if response_text then
+               state.heading_failure_message = nil
+            else
+               parse_error = clean_model_error(parse_error) or "invalid ollama response"
+            end
+
+            if live_term and live_term.heading_target_key == request.key and response_text then
+               local heading = parse_term_heading_output(response_text)
                if heading and set_term_heading(live_term, heading) then
                   save_current_session()
                   rerender_active_view()
                end
                live_term.heading_applied_key = request.key
-            elseif live_term then
+            elseif live_term and response_text then
                live_term.heading_dirty = true
                live_term.heading_due_at = vim.uv.now()
+            elseif live_term then
+               live_term.heading_dirty = true
+               live_term.heading_due_at = vim.uv.now() + opts.debounce_ms
+               state.heading_backoff_until = vim.uv.now() + 15000
+               if parse_error ~= "" and parse_error ~= state.heading_failure_message then
+                  state.heading_failure_message = parse_error
+                  vim.notify("cmax auto headings: " .. parse_error, vim.log.levels.WARN)
+               end
             end
          else
             local error_text = clean_model_error(result.stderr ~= "" and result.stderr or result.stdout or "")
@@ -2138,7 +2188,7 @@ pump_term_heading_jobs = function()
    if not opts or not opts.enabled then return end
    if state.active_heading_job then return end
    if vim.uv.now() < (state.heading_backoff_until or 0) then return end
-   if vim.fn.executable(opts.command[1]) ~= 1 then return end
+   if vim.fn.executable("curl") ~= 1 then return end
 
    local best_term
    local best_request

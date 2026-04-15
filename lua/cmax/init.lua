@@ -179,6 +179,7 @@ local provider_session_id
 local pump_term_heading_jobs
 local find_terminal
 local rerender_active_view
+local push_limited_lines
 
 local function read_file(path)
    local f = io.open(path, "r")
@@ -297,8 +298,8 @@ local function normalize_tab_filter_opts(opts)
       timeout_ms = 45000,
       max_context_chars_per_tab = nil,
       max_reason_chars = 90,
-      parallel_jobs = 4,
-      max_output_tokens = 32,
+      parallel_jobs = 8,
+      max_output_tokens = 16,
    }
 
    opts = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -683,6 +684,47 @@ local function get_term_prompt_history(term)
    return get_session_prompt_history(term.provider, provider_session_id(term))
 end
 
+local function build_prompt_history_text(prompts, max_chars)
+   local lines = {}
+
+   local function append(text)
+      text = normalize_search_text(text)
+      if not text then return end
+      push_limited_lines(lines, text, max_chars)
+   end
+
+   for _, prompt in ipairs(prompts or {}) do
+      append(prompt)
+   end
+
+   return table.concat(lines, "\n")
+end
+
+local function get_term_filter_prompt_text(term, max_chars)
+   local prompts = get_term_prompt_history(term) or {}
+   local session_id = provider_session_id(term)
+   local cache_key = table.concat({
+      term.provider or "",
+      session_id or "",
+      tostring(#prompts),
+      prompts[#prompts] or "",
+      tostring(max_chars or "all"),
+   }, "\31")
+
+   if term.tab_filter_prompt_cache_key == cache_key and type(term.tab_filter_prompt_cache_text) == "string" then
+      return term.tab_filter_prompt_cache_text
+   end
+
+   local text = ""
+   if #prompts > 0 then
+      text = build_prompt_history_text(prompts, max_chars)
+   end
+
+   term.tab_filter_prompt_cache_key = cache_key
+   term.tab_filter_prompt_cache_text = text
+   return text
+end
+
 local function build_heading_context(prompts, max_context_chars)
    local lines = {}
 
@@ -848,7 +890,7 @@ local function parse_ollama_generate_output(output)
    return decoded.response
 end
 
-local function push_limited_lines(lines, line, max_chars)
+push_limited_lines = function(lines, line, max_chars)
    if not line or line == "" then return 0 end
    lines[#lines + 1] = line
 
@@ -875,20 +917,17 @@ local function find_claude_project_path(session_id)
 end
 
 local function collect_term_transcript_lines(term, max_chars)
+   local prompt_text = get_term_filter_prompt_text(term, max_chars)
+   if prompt_text ~= "" then
+      return vim.split(prompt_text, "\n", { plain = true, trimempty = true })
+   end
+
    local lines = {}
 
    local function append(text)
       text = normalize_search_text(text)
       if not text then return end
       push_limited_lines(lines, text, max_chars)
-   end
-
-   local prompts = get_term_prompt_history(term) or {}
-   if #prompts > 0 then
-      for _, prompt in ipairs(prompts) do
-         append(prompt)
-      end
-      return lines
    end
 
    if term.provider == "codex" then

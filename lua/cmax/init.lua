@@ -1756,6 +1756,18 @@ local function render_filtered_terminals(win)
          end
          table.insert(lines, bottom)
       end
+
+      if state.tab_filter_loading then
+         local progress = string.format("%d/%d tabs checked", state.tab_filter_progress_done or 0, state.tab_filter_progress_total or 0)
+         if (state.tab_filter_failure_count or 0) > 0 then
+            progress = progress .. string.format("  %d failed", state.tab_filter_failure_count)
+         end
+         table.insert(lines, top)
+         table.insert(lines, pad_line("Scanning remaining tabs...", inner_width))
+         table.insert(lines, pad_line(progress, inner_width))
+         table.insert(lines, pad_line(state.tab_filter_query or "", inner_width))
+         table.insert(lines, bottom)
+      end
    end
 
    vim.bo[buf].modifiable = true
@@ -1935,16 +1947,24 @@ local function build_filtered_tab_items(results)
             tab_index = candidate.tab_index,
             heading = candidate.heading,
             reason = truncate_text(result.reason or "semantic match", max_reason_chars),
-            display_score = "related",
+            display_score = result.source == "lexical" and "keyword" or "related",
             status = candidate.status or "",
             display_cwd = shorten_path(candidate.cwd or ""),
+            source_priority = result.source == "lexical" and 0 or 1,
          }
       end
    end
 
    table.sort(items, function(a, b)
+      if a.source_priority ~= b.source_priority then
+         return a.source_priority < b.source_priority
+      end
       return a.tab_index < b.tab_index
    end)
+
+   for _, item in ipairs(items) do
+      item.source_priority = nil
+   end
 
    return items
 end
@@ -1981,11 +2001,15 @@ local function pump_tab_filter_jobs(request)
    end
 
    local opts = state.tab_filter_opts or {}
-   local max_running = math.max(1, math.min(opts.parallel_jobs or 1, request.total))
+   local remaining_total = #request.candidates
+   local max_running = math.max(1, math.min(opts.parallel_jobs or 1, remaining_total))
 
-   while request.running < max_running and request.next_index <= request.total do
+   while request.running < max_running and request.next_index <= remaining_total do
       local candidate = request.candidates[request.next_index]
       request.next_index = request.next_index + 1
+      if not candidate then
+         break
+      end
       request.running = request.running + 1
 
       local handle = vim.system(build_ollama_generate_command(request.model, build_tab_filter_prompt(request.query, candidate), opts), {
@@ -2012,6 +2036,7 @@ local function pump_tab_filter_jobs(request)
                if ok then
                   request.results[#request.results + 1] = vim.tbl_extend("force", parsed, {
                      candidate = candidate,
+                     source = "model",
                   })
                   state.filtered_terminals = build_filtered_tab_items(request.results)
                else
@@ -2112,6 +2137,7 @@ prompt_tab_filter = function()
          if lexical then
             request.results[#request.results + 1] = vim.tbl_extend("force", lexical, {
                candidate = candidate,
+               source = "lexical",
             })
             request.completed = request.completed + 1
          else

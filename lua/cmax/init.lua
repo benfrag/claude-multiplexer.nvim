@@ -369,6 +369,106 @@ truncate_text = function(text, max_len)
    return text:sub(1, max_len - 3) .. "..."
 end
 
+local QUERY_SYNONYMS = {
+   settings = { "setting", "settings", "config", "configs", "configuration", "configurations", "preference", "preferences", "option", "options" },
+   config = { "config", "configs", "configuration", "configurations", "settings", "setting", "option", "options", "preferences" },
+   configuration = { "configuration", "configurations", "config", "configs", "settings", "preferences", "options" },
+   preference = { "preference", "preferences", "settings", "options", "config", "configuration" },
+   option = { "option", "options", "settings", "preferences", "config", "configuration" },
+}
+
+local function tokenize_search_terms(text)
+   text = normalize_search_text(text)
+   if not text then return {} end
+
+   local tokens = {}
+   local seen = {}
+   for token in text:lower():gmatch("[a-z0-9][a-z0-9_%-]*") do
+      if token:sub(-1) == "s" and #token > 4 then
+         local singular = token:sub(1, -2)
+         if not seen[singular] then
+            tokens[#tokens + 1] = singular
+            seen[singular] = true
+         end
+      end
+      if not seen[token] then
+         tokens[#tokens + 1] = token
+         seen[token] = true
+      end
+   end
+
+   return tokens
+end
+
+local function expand_query_terms(query)
+   local terms = {}
+   for _, token in ipairs(tokenize_search_terms(query)) do
+      local variants = QUERY_SYNONYMS[token] or { token }
+      terms[#terms + 1] = variants
+   end
+   return terms
+end
+
+local function lexical_tab_filter_match(query, candidate)
+   local query_norm = normalize_search_text(query)
+   if not query_norm then return nil end
+   query_norm = query_norm:lower()
+
+   local sections = {
+      { reason = "heading hit", text = normalize_search_text(candidate.heading) },
+      { reason = "prompt hit", text = normalize_search_text(candidate.last_prompt) },
+      { reason = "history hit", text = normalize_search_text(candidate.user_prompts) },
+      { reason = "path hit", text = normalize_search_text(candidate.cwd) },
+   }
+
+   for _, section in ipairs(sections) do
+      local haystack = section.text and section.text:lower() or nil
+      if haystack and haystack:find(query_norm, 1, true) then
+         return {
+            match = true,
+            reason = section.reason,
+         }
+      end
+   end
+
+   local term_groups = expand_query_terms(query_norm)
+   if #term_groups == 0 then return nil end
+
+   local matched = 0
+   local best_reason = nil
+   for _, variants in ipairs(term_groups) do
+      local found = false
+      for _, section in ipairs(sections) do
+         local haystack = section.text and section.text:lower() or nil
+         if haystack then
+            for _, variant in ipairs(variants) do
+               if haystack:find(variant, 1, true) then
+                  found = true
+                  best_reason = best_reason or section.reason
+                  break
+               end
+            end
+         end
+         if found then break end
+      end
+      if found then
+         matched = matched + 1
+      end
+   end
+
+   if matched == 0 then return nil end
+
+   local ratio = matched / #term_groups
+   if #term_groups == 1 or ratio >= 0.6 then
+      return {
+         match = true,
+         reason = best_reason or "term hit",
+      }
+   end
+
+   return nil
+end
+
 local function shorten_path(path)
    if type(path) ~= "string" or path == "" then return "" end
    local home = vim.env.HOME or ""
@@ -864,12 +964,14 @@ local function build_tab_filter_prompt(query, candidate)
 
    return table.concat({
       "You evaluate whether a single open Neovim chat tab matches a semantic query.",
-      'Return JSON only in the exact shape {"match":true,"score":0.0,"reason":"..."} and nothing else.',
+      'Return JSON only in the exact shape {"match":true,"reason":"..."} and nothing else.',
       "Rules:",
       "- Consider the tab heading, last prompt, provider, status, cwd, and the full user prompt history.",
+      "- Be liberal about relatedness. If the tab plausibly relates to the query, prefer match=true.",
+      "- Treat common related terms as relevant, for example settings/config/preferences/options.",
       "- match must be true or false.",
-      "- If the tab is not relevant, set match=false and score=0.",
-      "- If the tab is relevant, set match=true and score between 0 and 1.",
+      "- If the tab is not relevant, set match=false.",
+      "- If the tab is plausibly related, set match=true.",
       "- reason must be a very short phrase, not a sentence.",
       "",
       vim.json.encode(payload),
@@ -890,24 +992,19 @@ local function parse_tab_filter_output(output)
 
    local is_match = decoded.match
    if type(is_match) == "string" then
-      is_match = is_match == "true"
+      local normalized = is_match:lower()
+      if normalized == "true" or normalized == "yes" then
+         is_match = true
+      elseif normalized == "false" or normalized == "no" then
+         is_match = false
+      end
    end
    if type(is_match) ~= "boolean" then
       return nil, false
    end
 
-   local score = tonumber(decoded.score) or 0
-   if not is_match then
-      score = 0
-   elseif score < 0 then
-      score = 0
-   elseif score > 1 then
-      score = 1
-   end
-
    return {
       match = is_match,
-      score = score,
       reason = normalize_search_text(decoded.reason) or (is_match and "semantic match" or "not relevant"),
    }, true
 end
@@ -1833,16 +1930,12 @@ local function build_filtered_tab_items(results)
    for _, result in ipairs(results or {}) do
       if result.match and result.candidate then
          local candidate = result.candidate
-         local score = tonumber(result.score) or 0
-         if score < 0 then score = 0 end
-         if score > 1 then score = 1 end
          items[#items + 1] = {
             cmax_id = candidate.cmax_id,
             tab_index = candidate.tab_index,
             heading = candidate.heading,
             reason = truncate_text(result.reason or "semantic match", max_reason_chars),
-            score = score,
-            display_score = string.format("match %.0f%%", score * 100),
+            display_score = "related",
             status = candidate.status or "",
             display_cwd = shorten_path(candidate.cwd or ""),
          }
@@ -1850,10 +1943,7 @@ local function build_filtered_tab_items(results)
    end
 
    table.sort(items, function(a, b)
-      if a.score == b.score then
-         return a.tab_index < b.tab_index
-      end
-      return a.score > b.score
+      return a.tab_index < b.tab_index
    end)
 
    return items
@@ -2006,7 +2096,7 @@ prompt_tab_filter = function()
          model = opts.model
             or (state.auto_heading_opts and state.auto_heading_opts.model)
             or "qwen2.5:1.5b",
-         candidates = candidates,
+         candidates = {},
          total = #candidates,
          next_index = 1,
          running = 0,
@@ -2016,11 +2106,29 @@ prompt_tab_filter = function()
          results = {},
          handles = {},
       }
+
+      for _, candidate in ipairs(candidates) do
+         local lexical = lexical_tab_filter_match(query, candidate)
+         if lexical then
+            request.results[#request.results + 1] = vim.tbl_extend("force", lexical, {
+               candidate = candidate,
+            })
+            request.completed = request.completed + 1
+         else
+            request.candidates[#request.candidates + 1] = candidate
+         end
+      end
+
       state.active_tab_filter_job = request
-      state.tab_filter_progress_done = 0
+      state.tab_filter_progress_done = request.completed
       state.tab_filter_progress_total = #candidates
       state.tab_filter_failure_count = 0
-      show_tab_filter_results({}, query, { loading = true })
+      state.filtered_terminals = build_filtered_tab_items(request.results)
+      show_tab_filter_results(state.filtered_terminals, query, { loading = #request.candidates > 0 })
+      if #request.candidates == 0 then
+         finalize_tab_filter_request(request)
+         return
+      end
       pump_tab_filter_jobs(request)
    end)
 end
